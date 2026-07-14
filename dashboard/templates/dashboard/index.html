@@ -1,0 +1,327 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MES Dashboard</title>
+    <link rel="stylesheet" href="{% static 'dashboard/css/style.css' %}?v=20260714_01">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
+</head>
+<body class="sidebar-collapsed">
+
+<div id="statusBanner" class="status-banner" hidden>
+    <span id="statusBannerText"></span>
+    <span id="statusBannerClose" class="status-banner-close" title="Fechar">&times;</span>
+</div>
+
+<button id="sidebarToggle" class="sidebar-toggle" title="Mostrar/Ocultar filtros">☰</button>
+<button id="settingsToggle" class="settings-toggle" title="Configurações" aria-label="Abrir configurações">⚙</button>
+
+<div id="settingsOverlay" class="settings-overlay" hidden>
+    <div class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <h2 id="settingsTitle">Configurações do Dashboard</h2>
+
+        <div class="settings-fields">
+            <div class="settings-field">
+                <label for="cfgGoal">Meta de produção (UPH)</label>
+                <input id="cfgGoal" type="number" min="0" step="50">
+                <small>Linha tracejada laranja no gráfico UPH</small>
+            </div>
+
+            <div class="settings-field">
+                <label for="cfgUphMax">Eixo Y do UPH (máximo padrão)</label>
+                <input id="cfgUphMax" type="number" min="100" step="100">
+                <small>O eixo cresce além disso se a produção passar</small>
+            </div>
+
+            <div class="settings-field">
+                <label for="cfgHotLimit">Limite vermelho nas matrizes</label>
+                <input id="cfgHotLimit" type="number" min="0" step="1">
+                <small>Célula fica vermelha quando falhas &gt; este valor</small>
+            </div>
+
+            <div class="settings-field">
+                <label for="cfgRefresh">Atualização automática (segundos)</label>
+                <input id="cfgRefresh" type="number" min="5" step="5">
+                <small>Intervalo de recarga dos dados (mín. 5s)</small>
+            </div>
+
+            <div class="settings-field">
+                <label for="cfgOnlineMin">Limiar ONLINE (minutos)</label>
+                <input id="cfgOnlineMin" type="number" min="1" step="5">
+                <small>Sem dados novos além disso = banner OFFLINE</small>
+            </div>
+
+            <div class="settings-field">
+                <label for="cfgParetoN">Falhas no Pareto (1–20)</label>
+                <input id="cfgParetoN" type="number" min="1" max="20" step="1">
+                <small>Quantidade de falhas exibidas no gráfico Pareto</small>
+            </div>
+
+            <div class="settings-field">
+                <label for="cfgYieldYellow">Saúde do canal: amarelo abaixo de (%)</label>
+                <input id="cfgYieldYellow" type="number" min="0" max="100" step="0.5">
+                <small>Yield do canal abaixo disso = atenção (amarelo)</small>
+            </div>
+
+            <div class="settings-field">
+                <label for="cfgYieldRed">Saúde do canal: vermelho abaixo de (%)</label>
+                <input id="cfgYieldRed" type="number" min="0" max="100" step="0.5">
+                <small>Yield do canal abaixo disso = acionar manutenção (vermelho)</small>
+            </div>
+
+            <div class="settings-field">
+                <label for="cfgCycleLimit">Limite de ciclos do carrier</label>
+                <input id="cfgCycleLimit" type="number" min="100" step="100">
+                <small>Vida útil em passagens pelo testador — aviso automático ao atingir (alerta prévio a partir de 90%)</small>
+            </div>
+
+            <div class="settings-field settings-field-checkbox">
+                <label for="cfgTvMode">
+                    <input id="cfgTvMode" type="checkbox">
+                    Modo TV (tela cheia, sem filtros)
+                </label>
+                <small>Para o televisor do chão de fábrica — esconde a barra lateral e entra em tela cheia</small>
+            </div>
+        </div>
+
+        <div class="settings-actions">
+            <button type="button" id="settingsSave" class="settings-btn-primary">Salvar</button>
+            <button type="button" id="settingsReset" class="settings-btn-secondary">Restaurar padrões</button>
+            <button type="button" id="settingsClose" class="settings-btn-secondary">Fechar</button>
+        </div>
+    </div>
+</div>
+
+<div class="layout">
+
+    <aside id="sidebar" class="sidebar">
+        <h2>MES FILTERS</h2>
+
+        <label>Station</label>
+        <select id="filterStation">
+            <option value="">Todas as estações</option>
+        </select>
+
+        <label>Model</label>
+        <select id="filterModel">
+            <option value="">Todos os modelos</option>
+        </select>
+
+        <label>Canal</label>
+        <select id="filterChannel">
+            <option value="">Todos os canais</option>
+        </select>
+
+        <label>Carrier</label>
+        <select id="filterCarrier">
+            <option value="">Todos os carriers</option>
+        </select>
+
+        <label>Step (falha)</label>
+        <select id="filterStep">
+            <option value="">Todos os steps</option>
+        </select>
+
+        <label>Data Inicial</label>
+        <input id="filterDateFrom" type="datetime-local">
+
+        <label>Data Final</label>
+        <input id="filterDateTo" type="datetime-local">
+
+        <button type="button" onclick="loadDashboard()">Aplicar Filtros</button>
+        <button type="button" class="secondary-btn" onclick="resetFilters()">Limpar Filtros</button>
+
+        <hr>
+
+        <h3>EEData / SPC</h3>
+
+        <label>Step Paramétrico</label>
+        <select id="stepSelect">
+            <option value="PACK">PACK</option>
+            <option value="SLEEP">SLEEP</option>
+            <option value="CONS">CONS</option>
+            <option value="PDCIR">PDCIR</option>
+            <option value="NDCIR">NDCIR</option>
+            <option value="DCIR">DCIR</option>
+            <option value="OV">OV</option>
+            <option value="OVR">OVR</option>
+            <option value="OVD">OVD</option>
+            <option value="UVD">UVD</option>
+            <option value="DOC">DOC</option>
+            <option value="COC">COC</option>
+            <option value="Temperature">Temperature</option>
+        </select>
+
+        <label>USL <small>(deixe vazio = automático)</small></label>
+        <input id="spcUsl" type="number" step="any" placeholder="μ + 3σ">
+
+        <label>LSL <small>(deixe vazio = automático)</small></label>
+        <input id="spcLsl" type="number" step="any" placeholder="μ − 3σ">
+
+        <button type="button" class="spc-btn" onclick="openSpcPanel()">Analisar Step</button>
+    </aside>
+
+    <main class="main">
+
+        <div class="status-strip">
+            <span id="stripState" class="strip-state">●&nbsp;VERIFICANDO…</span>
+            <span id="stripUpdated" class="strip-updated">Última atualização do banco: --</span>
+
+            <div class="matrix-toggle" id="matrixToggle" title="Período exibido nas tabelas de falhas">
+                <span class="matrix-toggle-label">Tabelas:</span>
+                <button type="button" id="mtHour" class="mt-btn active">Última hora</button>
+                <button type="button" id="mtPeriod" class="mt-btn">Período</button>
+            </div>
+
+            <div class="mode-switch">
+                <button type="button" id="modeOnline" class="mode-btn">ONLINE</button>
+                <button type="button" id="modeAnalise" class="mode-btn">ANÁLISE</button>
+            </div>
+        </div>
+
+        <div id="carrierAlert" class="carrier-alert" hidden></div>
+
+        <header class="topbar">
+            <div class="yield-card">
+                <span>FIRST PASS YIELD</span>
+                <strong id="yieldValue">--%</strong>
+            </div>
+
+            <div class="title-card" id="dashboardTitle">
+                DASHBOARD FT - MONITORAMENTO EM TEMPO REAL
+            </div>
+
+            <div class="pass-card">
+                <span>PASS</span>
+                <strong id="passValue"><span class="status-icon status-icon-good">&#10003;</span>--</strong>
+            </div>
+
+            <div class="fail-card">
+                <span>FAIL</span>
+                <strong id="failValue"><span class="status-icon status-icon-critical">&#10007;</span>--</strong>
+            </div>
+        </header>
+
+        <section class="grid">
+
+            <div class="panel area-pareto">
+                <h3>PARETO FALHAS</h3>
+                <canvas id="topFailuresChart"></canvas>
+            </div>
+
+            <div class="panel area-uph">
+                <h3>UPH</h3>
+                <canvas id="hourlyYieldChart"></canvas>
+            </div>
+
+            <div class="panel area-channels">
+                <h3>CHANNELS</h3>
+                <div id="channelHealth" class="channel-health"></div>
+                <div class="channel-legend">
+                    <span class="lg lg-good">Saudável</span>
+                    <span class="lg lg-warn">Degradando</span>
+                    <span class="lg lg-int">Intermitente</span>
+                    <span class="lg lg-bad">Crítico — acionar manutenção</span>
+                    <span class="lg lg-off">Sem produção</span>
+                </div>
+                <canvas id="channelsChart"></canvas>
+            </div>
+
+            <div class="panel area-matrix1">
+                <h3>CHANNELS - FALHAS POR STEP × CANAL</h3>
+                <div class="table-wrap">
+                    <table id="failureChannelMatrix" class="matrix-table">
+                        <thead></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="panel area-matrix2">
+                <button type="button" id="carrierManagerBtn" class="panel-tool-btn" title="Gerenciar ciclos dos carriers">CICLOS</button>
+                <h3>CARRIER - FALHAS POR CARRIER × CANAL</h3>
+                <div class="table-wrap">
+                    <table id="carrierChannelMatrix" class="matrix-table">
+                        <thead></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+
+        </section>
+
+    </main>
+
+</div>
+
+<div id="spcOverlay" class="settings-overlay" hidden>
+    <div class="settings-modal spc-modal" role="dialog" aria-modal="true" aria-labelledby="spcTitle">
+        <h2 id="spcTitle">Distribuição Paramétrica — <span id="spcStepLabel">--</span></h2>
+
+        <div class="spc-layout">
+            <div class="spc-chart-wrap">
+                <canvas id="spcChart"></canvas>
+            </div>
+            <div class="spc-stats">
+                <div class="stats-title">ESTATÍSTICAS</div>
+                <table class="stats-table">
+                    <tr><th>N</th><td id="statCount">--</td></tr>
+                    <tr><th>Média (μ)</th><td id="statMean">--</td></tr>
+                    <tr><th>Desvio (σ)</th><td id="statStd">--</td></tr>
+                    <tr><th>Mín</th><td id="statMin">--</td></tr>
+                    <tr><th>Máx</th><td id="statMax">--</td></tr>
+                    <tr><th>P5</th><td id="statP5">--</td></tr>
+                    <tr><th>P95</th><td id="statP95">--</td></tr>
+                    <tr><th class="limit-usl">USL</th><td id="statUsl" class="limit-usl">--</td></tr>
+                    <tr><th class="limit-lsl">LSL</th><td id="statLsl" class="limit-lsl">--</td></tr>
+                    <tr class="cp-row"><th>Cp</th><td id="statCp">--</td></tr>
+                    <tr class="cp-row"><th>Cpk</th><td id="statCpk">--</td></tr>
+                </table>
+                <div id="cpkBadge" class="cpk-badge" style="display:none"></div>
+            </div>
+        </div>
+
+        <div class="settings-actions">
+            <button type="button" id="spcClose" class="settings-btn-secondary">Fechar</button>
+        </div>
+    </div>
+</div>
+
+<div id="carrierManagerOverlay" class="settings-overlay" hidden>
+    <div class="settings-modal carrier-manager" role="dialog" aria-modal="true" aria-labelledby="carrierManagerTitle">
+        <h2 id="carrierManagerTitle">Ciclos dos Carriers</h2>
+        <p class="cm-hint">
+            <strong>Zerar</strong> = carrier físico substituído: a contagem recomeça de agora.
+            <strong>Limite</strong> vazio usa o limite global das configurações.
+            Alerta automático a partir de 90% do limite.
+        </p>
+
+        <div class="cm-table-wrap">
+            <table id="carrierManagerTable" class="cm-table">
+                <thead>
+                    <tr>
+                        <th>Carrier</th>
+                        <th>Ciclos</th>
+                        <th>Contando</th>
+                        <th>Limite</th>
+                        <th>Status</th>
+                        <th>Ação</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="settings-actions">
+            <button type="button" id="carrierManagerClose" class="settings-btn-secondary">Fechar</button>
+        </div>
+    </div>
+</div>
+
+<script src="{% static 'dashboard/js/dashboard.js' %}?v=20260714_01"></script>
+</body>
+</html>

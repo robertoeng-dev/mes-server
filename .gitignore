@@ -1,0 +1,10 @@
+.env
+.env.local
+venv/
+__pycache__/
+*.pyc
+db.sqlite3
+
+# Local-only Claude Code state (machine-specific, not shared config)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
