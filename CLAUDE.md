@@ -11,8 +11,16 @@ from a Postgres table (`mes_test_results`) that is populated by an external
 system; this app is **read-only** against that table (no writes, no models for
 it, no migrations for it).
 
-Not a git repository yet (no `.git`). A `.gitignore` has been added in
-anticipation of initializing one at the factory.
+Published on GitHub: **https://github.com/robertoeng-dev/mes-server** (public,
+branch `main`). Sibling project (the client that writes `mes_test_results`,
+see "Data quality" below) is at **https://github.com/robertoeng-dev/mes-client**.
+Local git identity is set per-repo to `Roberto Parente <robertotec.eng3@gmail.com>`
+(matches the GitHub account `robertoeng-dev`). `.claude/settings.local.json` and
+`.claude/scheduled_tasks.lock` are gitignored (machine-local, not shared config);
+`.claude/skills/` is tracked. The factory's real internal IP is deliberately
+kept out of every tracked file in this repo (see "Data quality" — it was
+present in this file and `start_production.bat` before the first push and was
+generalized to "host set in .env").
 
 ## Commands
 
@@ -166,6 +174,29 @@ barcode, pattern like `A06T10`/`A17RT1` for retests) lives in `row_data->>'barco
 This was a real bug found and fixed in this table — don't reintroduce
 `device_name` into the carrier COALESCE.
 
+**Carrier normalization also handles two barcode-scanner data-quality issues
+(2026-07-14):** (1) `services.dedupe_doubled_scan()` collapses a
+double-triggered scanner read (`'A06T01A06T01'` → `'A06T01'`, detected by
+the value being exactly two identical halves concatenated) so the same
+physical carrier doesn't fragment into a phantom second "carrier" in the
+dropdowns/matrix; (2) rows with real test result data (`result IS NOT NULL`)
+but an empty barcode are labeled `'SEM BARCODE'` instead of falling all the
+way to the generic `'N/A'` — `carrier_channel_matrix()`'s WHERE clause
+excludes `''`/`'N/A'` but **not** `'SEM BARCODE'`, so this failure data stays
+visible instead of silently vanishing from the matrix (on the local dev
+dataset this surfaced 2,733 previously-hidden failures). **Landmine already
+hit once:** `dedupe_doubled_scan()`'s SQL uses the modulo operator (`% 2`)
+inline in an f-string that gets passed to `cursor.execute(sql, params)` —
+psycopg2 does %-style substitution on the query text whenever a `params`
+argument is given, so a literal `%` must be escaped as `%%` or it miscounts
+placeholders against `params` and throws `IndexError: list index out of
+range` (only reproduces once the surrounding query has other `%s` params —
+a bare `cursor.execute(sql)` with no params never triggers it, which is why
+an isolated smoke test without params can pass while the real endpoint
+500s). Same category of bug as the SPC parameter-ordering landmine below —
+check parameter/placeholder alignment carefully whenever composing raw SQL
+fragments that end up inside a parameterized `cursor.execute()`.
+
 **"Cycle" = one physical pass of a carrier through the tester**, detected by
 session-gapping timestamps per carrier: a burst of ~20 rows arriving within
 `CYCLE_GAP_SECONDS` (30s, tuned against real data — 60s over-merged
@@ -177,8 +208,8 @@ that starts a new one. See `services.carrier_cycles()`.
 via Chart.js (CDN) + chartjs-plugin-datalabels. Static assets are cache-busted
 with a `?v=YYYYMMDD_NN` query string in `index.html` on **both** the CSS and
 JS `<link>`/`<script>` tags — **bump both together whenever you change either
-file** (currently at `_06`; next change → `_07`), since the browser/dashboard
-PC otherwise caches the old file indefinitely.
+file** (currently `20260715_01`), since the browser/dashboard PC otherwise
+caches the old file indefinitely.
 
 Layout is a single CSS Grid (`.grid` in `style.css`, now a 10-column grid)
 laid out via `grid-template-areas` (`pareto`/`uph`/`channels`/`matrix1`/`matrix2`)
@@ -283,24 +314,145 @@ expected) the instant any filter is set, which in this dashboard is always
 (date range defaults on every load). Verified via Playwright end-to-end
 (histogram, annotation lines, Cp/Cpk stats, badge all render) after the fix.
 
-## Current status / open TODOs (as of 2026-07-13)
+## Carrier normalization: doubled-scan dedup + "SEM BARCODE" (2026-07-15)
+
+Two data-quality fixes layered onto `get_exprs()['carrier']` (in
+`services.py`), both aimed at not silently losing real statistics:
+
+1. **`dedupe_doubled_scan(expr)`** collapses a double-triggered barcode
+   scanner read — the value being exactly two identical halves concatenated
+   (`'A06T01A06T01'` → `'A06T01'`) — so the same physical carrier doesn't
+   fragment into a phantom second "carrier" everywhere carrier is grouped
+   (dropdowns, matrix, cycle counter). Applied to the raw `barcode` value
+   before the rest of the COALESCE chain.
+2. Rows with real test result data (`result IS NOT NULL`) but an **empty**
+   barcode are labeled `'SEM BARCODE'` instead of falling through to the
+   generic `'N/A'` — `carrier_channel_matrix()`'s WHERE clause excludes
+   `''`/`'N/A'` but not `'SEM BARCODE'`, so this failure data stays visible
+   in the matrix (surfaced 2,733 previously-hidden failures on the local dev
+   dataset) instead of vanishing silently.
+
+**Landmine hit AGAIN, same root cause as the SPC one above, different
+symptom:** `dedupe_doubled_scan()`'s SQL uses the modulo operator (`% 2`)
+inline, which must be escaped as `%%` since psycopg2 does %-style
+substitution on the query text whenever `cursor.execute(sql, params)` is
+called with a `params` argument. **But** `carrier_cycles()` — which also
+embeds `get_exprs()['carrier']` — called `cursor.execute(sql)` with **no**
+params argument at all, and psycopg2 only does %-substitution when a params
+arg is *provided* (even an empty list/tuple). So the `%%` correctly collapses
+to `%` everywhere params are passed, but arrives at Postgres as a literal,
+invalid `%%` in `carrier_cycles()`, throwing `ProgrammingError: operador não
+existe: integer %% integer`. Fixed by changing that call to
+`cursor.execute(sql, [])` — always pass a params arg (even empty) on any
+query built from `get_exprs()`, for exactly this reason. Before adding a new
+`%` (modulo, LIKE-wildcard, anything) into a SQL fragment shared via
+`get_exprs()`, grep every `cursor.execute(sql)` call for whether it embeds
+that same expression *and* is missing a params argument.
+
+## EEData / SPC: Cp/Cpk overview of ALL parametric steps at once (2026-07-15)
+
+Added alongside the original one-step-at-a-time `parametric_distribution()`
+modal (which still exists, now called "Detalhar Step Selecionado"): a full
+table of Cp/Cpk for every parametric step that has real numeric data in the
+current filter, mirroring the carrier-cycle-manager UX pattern (auto-detected
+defaults, per-row manual override, "clear to restore auto").
+
+**Where the limits come from — `mes_csv_schemas`, not a hardcoded list.**
+The MES Client already captures the CSV's row-2 spec line (PCM/CYG format:
+`'Nome(unidade)[lsl-usl]'`, e.g. `'Sleep Power(μA)[0.01-2]'`) into
+`mes_csv_schemas.{upper_limits_json,lower_limits_json,units_json,columns_json}`
+per `model_name` — this dashboard reads that table directly rather than
+re-parsing CSVs or hardcoding limits:
+- `services.discover_schema_specs(model_name=None)` — steps with a known
+  numeric LSL **and** USL (skips non-numeric/null entries and implausible
+  sentinel placeholders, `abs() > 1_000_000`, seen in some diagnostic-only
+  columns of other models).
+- `services.discover_step_candidates(model_name=None)` — the **full** column
+  list from the schema (`columns_json`) minus a `NON_PARAMETRIC_KEYS`
+  denylist (station/model/result/channel/carrier/timestamp/ID fields already
+  normalized elsewhere) — this is what makes steps *without* a defined limit
+  (e.g. `Temperature`) still show up (falls back to μ±3σ, marked "auto"),
+  instead of only showing steps `discover_schema_specs()` already knows about.
+  Any candidate that never has real numeric data in `row_data` simply produces
+  zero rows in the aggregate query and is dropped — no explicit filtering
+  needed for that case.
+- Both prefer the model's own schema (`ORDER BY last_seen DESC LIMIT 1` for
+  that `model_name`); without a model filter, the single most-recently-seen
+  schema across all models is used. On a multi-model line this is a known
+  simplification — `filters['model']` should usually be set when using this
+  feature if more than one product is active.
+- `services.step_cpk_overview(filters)` computes count/mean/stddev for
+  **every** candidate step in **one** query (`jsonb_each_text` unpivot +
+  `GROUP BY`, restricted to `WHERE j.key = ANY(%s)`) rather than one query per
+  step — this is the only reason showing 30-40 steps at once is cheap; don't
+  regress to a per-step loop calling `parametric_distribution()` 40 times.
+- **`dashboard_step_specs`** is a second dashboard-owned table (alongside
+  `dashboard_carriers`) for manual LSL/USL/unit overrides — same
+  lazy-`CREATE TABLE IF NOT EXISTS` pattern, same "any field can be cleared
+  back to auto by sending `null`" semantics via `services.set_step_spec()`.
+- A step whose schema has `usl <= lsl` (a real data-quality issue seen in the
+  wild — `R1T` in the local dev A06 schema has USL=5 lower than LSL=15,
+  apparently swapped at the source) shows `limits_valid: false` and a
+  "LIMITES INVERTIDOS NO SCHEMA" status instead of a nonsensical negative-then-positive
+  Cp/Cpk — **never** compute Cp/Cpk when `usl <= lsl`.
+- Clicking "Detalhar" on an overview row carries that row's *effective*
+  usl/lsl (schema or override) into the sidebar's `spcUsl`/`spcLsl` inputs
+  before opening the single-step modal — without this, the single-step view
+  falls back to its own independent μ±3σ auto-limit and shows a **different**
+  Cpk than what the user just saw in the overview for the same step, which
+  reads as a bug even though both numbers are individually "correct."
+- The sidebar's `stepSelect` dropdown is no longer a hardcoded 13-item HTML
+  `<option>` list — it's populated from the overview endpoint's actual
+  results (`fillStepSelect()` in `dashboard.js`, called after
+  `refreshStepSpecsOverview()`), so it only ever offers steps that really
+  have data, and grows automatically to the ~38 real ones instead of missing
+  most of them (`R1T`, `STC`, `DOCD2`, etc. weren't in the old hardcoded list).
+
+## Deploy — factory rollout planned 2026-07-16
+
+Both repos are being packaged together for a factory deploy the day after
+2026-07-15. **SERVER** (this repo): deployed by pulling the latest `main`
+onto the factory checkout (see `C:\MES_Server` note above) and restarting
+`start_production.bat` — no migrations to run (this app has none;
+`dashboard_carriers`/`dashboard_step_specs` self-create via
+`CREATE TABLE IF NOT EXISTS` on first request). **CLIENT**: the compiled
+installer, `MES_Client_Setup_v1.0.3.exe`, is the deployable artifact — built
+from source, not committed to git (`installer/Output/` is gitignored on
+purpose; distribute via a GitHub Release attachment on `mes-client`, not the
+repo tree). See each repo's README "Deploy em Produção" section for the
+step-by-step on the factory floor. Bump the cache-bust `?v=` query string
+(see above) before this deploy if `style.css`/`dashboard.js` changed since
+the last one shipped, or the shop-floor PC's browser will keep serving a
+stale cached copy after the pull.
+
+## Current status / open TODOs (as of 2026-07-15)
 
 Everything above is implemented, manually verified end-to-end against the
 local dev DB (server up, every endpoint hit, page loaded, filters/reset/limit
-round-tripped), and left in a working state. Remaining open items, in rough
-priority order:
+round-tripped, screenshotted via Playwright), and left in a working state.
+Both this repo and `mes-client` are pushed to GitHub. Remaining open items,
+in rough priority order:
 
-1. **Deploy the client-side parser fix to the factory.** `D:\MES_Client_Complete`'s
-   validation gate is code-complete and unit-tested but not yet run against
-   real factory CSVs (needs the factory PC — see `tests/regression_real_files.py`)
-   nor repackaged with PyInstaller. Until repackaged, the factory is still
-   running the old client binary (pre-fix) — new corrupted rows can still
-   land in `mes_test_results`, which is exactly what the dashboard-side
-   defenses above exist to tolerate in the meantime.
+1. **Regression-test the client parser fix against real factory CSVs before/
+   during tomorrow's deploy.** `mes-client`'s validation gate is code-complete,
+   unit-tested, and repackaged (`MES_Client_Setup_v1.0.3.exe`, Inno Setup
+   6.7.3 — turned out to already be installed on this dev machine per-user at
+   `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe`, not under Program Files).
+   Still **not** run against real factory CSVs (`tests/regression_real_files.py`
+   is ready but the real files only exist on the factory PC — run it there
+   before/right after installing v1.0.3) and the new installer has **not**
+   been run/tested anywhere yet (admin-privileged install to `C:\Utility\MES`
+   with Task Scheduler registration — deliberately not tested on this dev
+   box; first real run will be at the factory).
 2. **BMU-schema rows** (~1,093 rows in the local dev sample) are deliberately
    left unmapped/NULL — revisit only if BMU test data needs to appear in this
    dashboard, per an earlier explicit user decision.
-3. No outstanding bugs known in the dashboard itself as of this session.
+3. No outstanding bugs known in the dashboard itself as of this session (one
+   suspected filter-propagation issue during manual testing turned out to be
+   a test-script artifact, not a real bug — confirmed by calling
+   `loadDashboard()` directly, which worked correctly). The old superseded
+   local checkout (`E:\Mes_Server_DashBoard`) has been permanently deleted
+   (2026-07-14) — its one valuable piece, SPC/EEData, was already ported.
 
 **If you're picking this up fresh:** read the "Data quality" section above
 first — several of the SQL COALESCE choices here look arbitrary unless you

@@ -88,6 +88,40 @@ def api_spc_distribution(request):
     return JsonResponse(services.parametric_distribution(filters, step, usl, lsl))
 
 
+def api_spc_overview(request):
+    filters = services.get_filters(request)
+    return JsonResponse(services.step_cpk_overview(filters), safe=False)
+
+
+@csrf_exempt
+@require_POST
+def api_spc_spec_set(request):
+    try:
+        body = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return HttpResponseBadRequest("JSON inválido")
+
+    step = str(body.get("step", "")).strip()
+    if not step or len(step) > 64:
+        return HttpResponseBadRequest("step obrigatório")
+
+    def to_float_or_none(value):
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    usl = to_float_or_none(body.get("usl"))
+    lsl = to_float_or_none(body.get("lsl"))
+    unit = body.get("unit")
+    unit = str(unit)[:16] if unit else None
+
+    services.set_step_spec(step, usl=usl, lsl=lsl, unit=unit)
+    return JsonResponse({"ok": True, "step": step, "usl": usl, "lsl": lsl, "unit": unit})
+
+
 @csrf_exempt
 @require_POST
 def api_carrier_reset(request):

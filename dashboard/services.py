@@ -1,3 +1,5 @@
+import json
+
 from django.db import connection
 
 
@@ -62,6 +64,24 @@ def safe_timestamp(expr):
             WHEN {expr} ~ '^\\d{{2}}/\\d{{2}}/\\d{{4}} \\d{{2}}:\\d{{2}}:\\d{{2}}'
             THEN TO_TIMESTAMP({expr}, 'MM/DD/YYYY HH24:MI:SS')::timestamp
             ELSE NULL
+        END
+    """
+
+
+def dedupe_doubled_scan(expr):
+    """Corrige o leitor de código de barras disparando duas vezes: quando o
+    valor é a mesma string colada duas vezes seguidas (ex.: 'A06T01A06T01'),
+    mantém só a primeira metade ('A06T01') — sem isso, o mesmo carrier
+    fragmenta em dois "carriers" diferentes nas estatísticas."""
+    # %% escapado: psycopg2 faz substituição estilo % nos params do cursor,
+    # então um '%' literal (módulo, aqui) precisa virar '%%' no texto do SQL.
+    return f"""
+        CASE
+            WHEN length({expr}) > 0
+                 AND length({expr}) %% 2 = 0
+                 AND left({expr}, length({expr}) / 2) = right({expr}, length({expr}) / 2)
+            THEN left({expr}, length({expr}) / 2)
+            ELSE {expr}
         END
     """
 
@@ -143,11 +163,19 @@ def get_exprs():
         # device_name NÃO entra aqui: é o serial da fixture de cada canal
         # (1:1 com o canal, ex.: PT3009293614), não o carrier. O carrier real
         # é o barcode escaneado (ex.: A06T10, A17RT1).
+        #
+        # Duas correções sobre o barcode bruto, para não perder estatística:
+        # 1) leitura duplicada do scanner ('A06T01A06T01') colapsa para a
+        #    primeira metida ('A06T01') via dedupe_doubled_scan();
+        # 2) linha com resultado de teste real mas barcode vazio não cai
+        #    silenciosamente em 'N/A' (que a matriz Carrier×Canal exclui) —
+        #    fica marcada como 'SEM BARCODE', visível e agrupável à parte.
         carrier = f"""
             COALESCE(
-                NULLIF({json_text(json_col, "barcode")}, ''),
+                {dedupe_doubled_scan(f"NULLIF({json_text(json_col, 'barcode')}, '')")},
                 NULLIF({json_text(json_col, "carrier")}, ''),
                 NULLIF({json_text(json_col, "Carrier")}, ''),
+                CASE WHEN {result} IS NOT NULL THEN 'SEM BARCODE' END,
                 'N/A'
             )
         """
@@ -438,7 +466,11 @@ def carrier_cycles():
     """
 
     with connection.cursor() as cursor:
-        cursor.execute(sql)
+        # params=[] (não bare execute(sql)): força o psycopg2 a rodar sua
+        # passagem de substituição %-style, que colapsa o '%%' escapado do
+        # módulo em dedupe_doubled_scan() de volta a '%' antes de ir ao
+        # Postgres — sem isso, "%%" chega literal e vira erro de sintaxe.
+        cursor.execute(sql, [])
         rows = dictfetchall(cursor)
 
         # Carriers gerenciados sem nenhum registro após o baseline
@@ -569,6 +601,248 @@ def parametric_distribution(filters, step, usl=None, lsl=None, n_bins=30):
             "cpk": round(float(cpk), 3) if cpk is not None else None,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# EEData / SPC — visão geral de Cp/Cpk de TODOS os steps paramétricos de uma
+# vez (em vez de um por vez via parametric_distribution()).
+# ---------------------------------------------------------------------------
+
+# Tabela PRÓPRIA do dashboard para sobrescrever manualmente o LSL/USL de um
+# step — mesmo padrão de dashboard_carriers: auto-detectado por padrão,
+# editável, "limpar" volta ao automático.
+STEP_SPECS_TABLE = "dashboard_step_specs"
+
+# Sentinela de placeholder vindo de alguns schemas (registros de diagnóstico
+# sem limite físico real, ex.: chips de gauge) — descarta magnitude absurda.
+SPEC_SENTINEL_ABS_MAX = 1_000_000
+
+
+def ensure_step_specs_table():
+    sql = f"""
+        CREATE TABLE IF NOT EXISTS {STEP_SPECS_TABLE} (
+            step_key      TEXT PRIMARY KEY,
+            usl_override  DOUBLE PRECISION NULL,
+            lsl_override  DOUBLE PRECISION NULL,
+            unit_override TEXT NULL,
+            updated_at    TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(sql)
+
+
+# Chaves do schema que são metadado/identificação, não medida paramétrica
+# (já normalizadas em outro lugar via get_exprs(), ou texto/ID/timestamp) —
+# excluídas dos candidatos a "step". Qualquer outra chave sobra como
+# candidata; a que nunca tiver valor numérico real simplesmente não aparece
+# no resultado (auto-filtrada pela query de contagem).
+NON_PARAMETRIC_KEYS = {
+    "station_id", "Station", "machine_no", "device_name", "Station ID", "Reserve_StationID",
+    "Model", "model", "proj_code", "PN", "QualityPn",
+    "test_result", "TestResult", "result", "status", "Test PASS/FAIL STATUS",
+    "test_time", "TestTime", "datetime", "timestamp", "Test Start Time", "Test Stop Time",
+    "error_code", "SC_ERR_CODE", "SC_RESULT_CODE", "error_msg", "SC_ERR_MSG",
+    "List of Failing Tests",
+    "channel_no", "Channel", "CH", "channel",
+    "barcode", "carrier", "Carrier",
+    "_line_no", "line_no", "WO", "test_user", "Version", "Other",
+    "proc_name", "test_type", "SerialNumber", "Total",
+}
+
+
+def _to_float_or_none(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _latest_schema_row(model_name=None):
+    """Busca o schema (colunas + limites) mais recente de mes_csv_schemas —
+    capturado pelo cliente do cabeçalho do CSV (linha 2 do formato PCM/CYG:
+    'Nome(unidade)[lsl-usl]', ex.: 'Sleep Power(μA)[0.01-2]'). Usa o schema
+    mais recente do model_name informado; sem model, o mais recente entre
+    todos. Retorna (columns, upper, lower, units) já desserializados, ou
+    None se não houver nenhum schema capturado ainda."""
+    with connection.cursor() as cursor:
+        if model_name:
+            cursor.execute("""
+                SELECT columns_json, upper_limits_json, lower_limits_json, units_json
+                FROM mes_csv_schemas
+                WHERE model_name = %s
+                ORDER BY last_seen DESC LIMIT 1
+            """, [model_name])
+        else:
+            cursor.execute("""
+                SELECT columns_json, upper_limits_json, lower_limits_json, units_json
+                FROM mes_csv_schemas
+                ORDER BY last_seen DESC LIMIT 1
+            """)
+        row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    columns, upper, lower, units = row
+    columns = json.loads(columns) if isinstance(columns, str) else (columns or [])
+    upper = json.loads(upper) if isinstance(upper, str) else (upper or {})
+    lower = json.loads(lower) if isinstance(lower, str) else (lower or {})
+    units = json.loads(units) if isinstance(units, str) else (units or {})
+    return columns, upper, lower, units
+
+
+def discover_schema_specs(model_name=None):
+    """Descobre os steps paramétricos com limite conhecido e seus valores
+    (LSL/USL/unidade), a partir do schema mais recente em mes_csv_schemas."""
+    schema = _latest_schema_row(model_name)
+    if not schema:
+        return {}
+    _columns, upper, lower, units = schema
+
+    specs = {}
+    for key, usl_raw in upper.items():
+        usl = _to_float_or_none(usl_raw)
+        lsl = _to_float_or_none(lower.get(key))
+        if usl is None or lsl is None:
+            continue
+        if abs(usl) > SPEC_SENTINEL_ABS_MAX or abs(lsl) > SPEC_SENTINEL_ABS_MAX:
+            continue
+        specs[key] = {"usl": usl, "lsl": lsl, "unit": units.get(key) or ""}
+
+    return specs
+
+
+def discover_step_candidates(model_name=None):
+    """Todas as colunas do schema que podem ser um step paramétrico (para
+    achar também steps sem limite definido, ex.: Temperature — entram no
+    resultado com limite automático μ±3σ se tiverem dado numérico real)."""
+    schema = _latest_schema_row(model_name)
+    if not schema:
+        return set()
+    columns, _upper, _lower, _units = schema
+    return {c for c in columns if c and c not in NON_PARAMETRIC_KEYS}
+
+
+def step_overrides():
+    ensure_step_specs_table()
+    with connection.cursor() as cursor:
+        cursor.execute(f"""
+            SELECT step_key, usl_override, lsl_override, unit_override
+            FROM {STEP_SPECS_TABLE}
+        """)
+        return {
+            row[0]: {"usl": row[1], "lsl": row[2], "unit": row[3]}
+            for row in cursor.fetchall()
+        }
+
+
+def set_step_spec(step_key, usl=None, lsl=None, unit=None):
+    """Sobrescreve LSL/USL/unidade de um step. Qualquer valor None mantém o
+    automático (detectado de mes_csv_schemas) para aquele campo específico."""
+    ensure_step_specs_table()
+    sql = f"""
+        INSERT INTO {STEP_SPECS_TABLE} (step_key, usl_override, lsl_override, unit_override, updated_at)
+        VALUES (%s, %s, %s, %s, NOW())
+        ON CONFLICT (step_key) DO UPDATE
+        SET usl_override = EXCLUDED.usl_override,
+            lsl_override = EXCLUDED.lsl_override,
+            unit_override = EXCLUDED.unit_override,
+            updated_at = NOW()
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(sql, [step_key, usl, lsl, unit])
+
+
+def step_cpk_overview(filters):
+    """Cp/Cpk de todos os steps paramétricos conhecidos, calculado numa
+    única varredura (jsonb_each_text + GROUP BY) — não uma query por step."""
+    cols = table_columns()
+    json_col = get_json_column(cols)
+    if not json_col:
+        return []
+
+    model = filters.get("model") or None
+    auto_specs = discover_schema_specs(model)
+    overrides = step_overrides()
+    candidates = discover_step_candidates(model)
+
+    known_steps = sorted(candidates | set(auto_specs.keys()) | set(overrides.keys()))
+    if not known_steps:
+        return []
+
+    where_sql, params = build_where(filters)
+    numeric_re = r'^-?[0-9]+\.?[0-9]*([eE][+-]?[0-9]+)?$'
+
+    sql = f"""
+        WITH base AS (
+            SELECT {json_col} AS row_data
+            FROM {TABLE_NAME}
+            {where_sql}
+        ), unpivoted AS (
+            SELECT j.key AS step_key, (j.value)::float AS value
+            FROM base, jsonb_each_text(base.row_data) j
+            WHERE j.key = ANY(%s)
+              AND j.value ~ %s
+        )
+        SELECT step_key, COUNT(*), AVG(value), STDDEV_SAMP(value)
+        FROM unpivoted
+        GROUP BY step_key
+    """
+
+    with connection.cursor() as cursor:
+        cursor.execute(sql, params + [known_steps, numeric_re])
+        stats_by_step = {row[0]: row[1:] for row in cursor.fetchall()}
+
+    results = []
+    for step in known_steps:
+        stats = stats_by_step.get(step)
+        count = stats[0] if stats else 0
+        mean = float(stats[1]) if stats and stats[1] is not None else None
+        std = float(stats[2]) if stats and stats[2] is not None else 0.0
+
+        if not count or mean is None:
+            continue  # sem amostras neste período/filtro — não exibe
+
+        auto = auto_specs.get(step, {})
+        override = overrides.get(step, {})
+
+        usl = override.get("usl") if override.get("usl") is not None else auto.get("usl")
+        lsl = override.get("lsl") if override.get("lsl") is not None else auto.get("lsl")
+        unit = override.get("unit") if override.get("unit") else auto.get("unit", "")
+
+        limits_auto = usl is None or lsl is None
+        if limits_auto:
+            usl = mean + 3 * std
+            lsl = mean - 3 * std
+
+        limits_valid = usl > lsl
+        cp = cpk = None
+        if limits_valid and std > 0:
+            cp = (usl - lsl) / (6 * std)
+            cpu = (usl - mean) / (3 * std)
+            cpl = (mean - lsl) / (3 * std)
+            cpk = min(cpu, cpl)
+
+        results.append({
+            "step": step,
+            "unit": unit,
+            "count": count,
+            "mean": round(mean, 6),
+            "std": round(std, 6),
+            "usl": round(usl, 6),
+            "lsl": round(lsl, 6),
+            "usl_is_override": override.get("usl") is not None,
+            "lsl_is_override": override.get("lsl") is not None,
+            "limits_auto": limits_auto,
+            "limits_valid": limits_valid,
+            "cp": round(cp, 3) if cp is not None else None,
+            "cpk": round(cpk, 3) if cpk is not None else None,
+        })
+
+    # Piores Cpk primeiro (mais urgente para engenharia olhar)
+    results.sort(key=lambda r: (r["cpk"] is None, r["cpk"] if r["cpk"] is not None else 0))
+    return results
 
 
 def set_carrier_limit(carrier, limit):

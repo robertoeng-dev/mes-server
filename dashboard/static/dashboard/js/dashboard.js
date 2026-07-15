@@ -403,6 +403,16 @@ function renderCarrierManager() {
 // EEData / SPC — distribuição paramétrica (histograma + Cp/Cpk) de um step
 // ---------------------------------------------------------------------------
 
+// Classificação de Cpk compartilhada entre o modal de detalhe (um step) e a
+// visão geral (todos os steps) — mesmos limiares em um único lugar.
+function cpkClassify(cpk) {
+    if (cpk == null) return { cls: "cpk-poor", label: "--" };
+    if (cpk >= 1.67) return { cls: "cpk-excellent", label: "EXCELENTE" };
+    if (cpk >= 1.33) return { cls: "cpk-good", label: "BOM" };
+    if (cpk >= 1.0) return { cls: "cpk-acceptable", label: "ACEITÁVEL" };
+    return { cls: "cpk-poor", label: "INCAPAZ" };
+}
+
 function valueToIndex(value, bins) {
     if (!bins || !bins.length) return 0;
     const total = bins[bins.length - 1].x_end - bins[0].x;
@@ -455,20 +465,10 @@ function renderSpcPanel(data) {
     const badge = document.getElementById("cpkBadge");
     if (capability.cpk != null) {
         const cpk = Number(capability.cpk);
+        const info = cpkClassify(cpk);
         badge.style.display = "";
-        if (cpk >= 1.67) {
-            badge.textContent = `Cpk ${cpk.toFixed(3)} — EXCELENTE`;
-            badge.className = "cpk-badge cpk-excellent";
-        } else if (cpk >= 1.33) {
-            badge.textContent = `Cpk ${cpk.toFixed(3)} — BOM`;
-            badge.className = "cpk-badge cpk-good";
-        } else if (cpk >= 1.0) {
-            badge.textContent = `Cpk ${cpk.toFixed(3)} — ACEITÁVEL`;
-            badge.className = "cpk-badge cpk-acceptable";
-        } else {
-            badge.textContent = `Cpk ${cpk.toFixed(3)} — INCAPAZ`;
-            badge.className = "cpk-badge cpk-poor";
-        }
+        badge.textContent = `Cpk ${cpk.toFixed(3)} — ${info.label}`;
+        badge.className = `cpk-badge ${info.cls}`;
     } else {
         badge.style.display = "none";
     }
@@ -585,6 +585,128 @@ async function openSpcPanel() {
 function closeSpcPanel() {
     document.getElementById("spcOverlay").hidden = true;
     if (spcChart) { spcChart.destroy(); spcChart = null; }
+}
+
+// ---------------------------------------------------------------------------
+// EEData / SPC — visão geral de Cp/Cpk de TODOS os steps paramétricos
+// ---------------------------------------------------------------------------
+
+// Popula o <select id="stepSelect"> com os steps que realmente têm dado
+// numérico (vindo de /api/spc/overview/) — substitui a lista fixa antiga do
+// HTML, que não cobria todos os steps do CSV (ex.: R1T, STC, DOCD2 etc.).
+function fillStepSelect(steps) {
+    const select = document.getElementById("stepSelect");
+    const currentValue = select.value;
+    select.innerHTML = "";
+
+    steps.forEach(step => {
+        const opt = document.createElement("option");
+        opt.value = step;
+        opt.textContent = step;
+        select.appendChild(opt);
+    });
+
+    if (currentValue && steps.includes(currentValue)) {
+        select.value = currentValue;
+    }
+}
+
+async function refreshStepSpecsOverview() {
+    const query = getFiltersQuery();
+    let rows;
+    try {
+        rows = await fetchJson(`/api/spc/overview/?${query}`);
+    } catch (err) {
+        rows = [];
+    }
+    fillStepSelect(rows.map(r => r.step));
+    return rows;
+}
+
+function renderStepSpecsTable(rows) {
+    const tbody = document.querySelector("#stepSpecsTable tbody");
+    tbody.innerHTML = "";
+
+    if (!rows.length) {
+        tbody.innerHTML = `<tr><td colspan="7" class="cm-empty">Nenhum step paramétrico com dado numérico no filtro atual.</td></tr>`;
+        return;
+    }
+
+    rows.forEach(row => {
+        const tr = document.createElement("tr");
+        const autoTag = row.limits_auto ? " (auto)" : "";
+
+        let statusCls, statusTxt;
+        if (row.limits_valid === false) {
+            statusCls = "cm-over";
+            statusTxt = "LIMITES INVERTIDOS NO SCHEMA";
+        } else if (row.cpk == null) {
+            statusCls = "cm-ok";
+            statusTxt = "--";
+        } else {
+            const info = cpkClassify(row.cpk);
+            statusCls = info.cls === "cpk-poor" ? "cm-over"
+                : info.cls === "cpk-acceptable" ? "cm-near" : "cm-ok";
+            statusTxt = `${Number(row.cpk).toFixed(3)} — ${info.label}`;
+        }
+
+        tr.innerHTML = `
+            <td class="cm-name">${row.step}</td>
+            <td>${row.unit || ""}</td>
+            <td class="cm-cycles">${Number(row.count).toLocaleString("pt-BR")}</td>
+            <td><input type="number" step="any" class="cm-limit-input step-lsl-input"
+                       value="${row.lsl_is_override ? row.lsl : ""}"
+                       placeholder="${Number(row.lsl).toFixed(4)}${autoTag}"></td>
+            <td><input type="number" step="any" class="cm-limit-input step-usl-input"
+                       value="${row.usl_is_override ? row.usl : ""}"
+                       placeholder="${Number(row.usl).toFixed(4)}${autoTag}"></td>
+            <td><span class="cm-status ${statusCls}">${statusTxt}</span></td>
+            <td><button type="button" class="cm-reset-btn step-detail-btn">Detalhar</button></td>
+        `;
+
+        const saveOverride = async () => {
+            const lslRaw = tr.querySelector(".step-lsl-input").value;
+            const uslRaw = tr.querySelector(".step-usl-input").value;
+            try {
+                await postJson("/api/spc/specs/set/", {
+                    step: row.step,
+                    lsl: lslRaw === "" ? null : parseFloat(lslRaw),
+                    usl: uslRaw === "" ? null : parseFloat(uslRaw)
+                });
+                const rows2 = await refreshStepSpecsOverview();
+                renderStepSpecsTable(rows2);
+            } catch (err) {
+                alert(`Erro ao salvar limite: ${err.message}`);
+            }
+        };
+
+        tr.querySelector(".step-lsl-input").addEventListener("change", saveOverride);
+        tr.querySelector(".step-usl-input").addEventListener("change", saveOverride);
+
+        tr.querySelector(".step-detail-btn").addEventListener("click", async () => {
+            document.getElementById("stepSelect").value = row.step;
+            // Carrega o MESMO limite que a visão geral usou (schema ou
+            // override) no detalhe — sem isso, o detalhe recalcularia com
+            // seu próprio μ±3σ e mostraria um Cpk diferente do que acabou
+            // de aparecer na tabela, o que confundiria o usuário.
+            document.getElementById("spcUsl").value = row.limits_auto ? "" : row.usl;
+            document.getElementById("spcLsl").value = row.limits_auto ? "" : row.lsl;
+            closeStepSpecsManager();
+            await openSpcPanel();
+        });
+
+        tbody.appendChild(tr);
+    });
+}
+
+async function openStepSpecsManager() {
+    document.getElementById("stepSpecsOverlay").hidden = false;
+    const rows = await refreshStepSpecsOverview();
+    renderStepSpecsTable(rows);
+}
+
+function closeStepSpecsManager() {
+    document.getElementById("stepSpecsOverlay").hidden = true;
 }
 
 async function openCarrierManager() {
@@ -1268,6 +1390,7 @@ function wireSettingsEvents() {
             closeSettings();
             closeCarrierManager();
             closeSpcPanel();
+            closeStepSpecsManager();
         }
     });
 }
@@ -1295,6 +1418,12 @@ async function initDashboard() {
         if (event.target === event.currentTarget) closeSpcPanel();
     });
 
+    document.getElementById("stepSpecsBtn").addEventListener("click", openStepSpecsManager);
+    document.getElementById("stepSpecsClose").addEventListener("click", closeStepSpecsManager);
+    document.getElementById("stepSpecsOverlay").addEventListener("click", event => {
+        if (event.target === event.currentTarget) closeStepSpecsManager();
+    });
+
     wireSettingsEvents();
     wirePanelExpand();
     fillChannelSelect();
@@ -1303,6 +1432,7 @@ async function initDashboard() {
 
     setDefaultDates();
     await loadFilterOptions();
+    await refreshStepSpecsOverview();
     await checkOnlineStatus();
     await loadDashboard();
     applyRefreshInterval();
