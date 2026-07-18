@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MES Dashboard</title>
-    <link rel="stylesheet" href="{% static 'dashboard/css/style.css' %}?v=20260715_01">
+    <link rel="stylesheet" href="{% static 'dashboard/css/style.css' %}?v=20260718_01">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
@@ -134,6 +134,7 @@
 
         <button type="button" onclick="loadDashboard()">Aplicar Filtros</button>
         <button type="button" class="secondary-btn" onclick="resetFilters()">Limpar Filtros</button>
+        <button type="button" class="secondary-btn" onclick="exportFilteredXlsx(this)">Exportar para Excel (.xlsx)</button>
 
         <hr>
 
@@ -149,6 +150,9 @@
 
         <label>LSL <small>(deixe vazio = automático)</small></label>
         <input id="spcLsl" type="number" step="any" placeholder="μ − 3σ">
+
+        <label>Target <small>(opcional, para Cpm)</small></label>
+        <input id="spcTarget" type="number" step="any" placeholder="sem alvo definido">
 
         <button type="button" class="secondary-btn" onclick="openSpcPanel()">Detalhar Step Selecionado</button>
     </aside>
@@ -247,30 +251,79 @@
 </div>
 
 <div id="spcOverlay" class="settings-overlay" hidden>
-    <div class="settings-modal spc-modal" role="dialog" aria-modal="true" aria-labelledby="spcTitle">
-        <h2 id="spcTitle">Distribuição Paramétrica — <span id="spcStepLabel">--</span></h2>
+    <div class="settings-modal spc-modal minitab-report" role="dialog" aria-modal="true" aria-labelledby="spcTitle">
+        <h2 id="spcTitle">Relatório de Capacidade de Processo — <span id="spcStepLabel">--</span></h2>
 
-        <div class="spc-layout">
-            <div class="spc-chart-wrap">
-                <canvas id="spcChart"></canvas>
-            </div>
-            <div class="spc-stats">
-                <div class="stats-title">ESTATÍSTICAS</div>
+        <div class="minitab-grid">
+            <div class="minitab-process-data">
+                <div class="stats-title">DADOS DO PROCESSO</div>
                 <table class="stats-table">
-                    <tr><th>N</th><td id="statCount">--</td></tr>
-                    <tr><th>Média (μ)</th><td id="statMean">--</td></tr>
-                    <tr><th>Desvio (σ)</th><td id="statStd">--</td></tr>
-                    <tr><th>Mín</th><td id="statMin">--</td></tr>
-                    <tr><th>Máx</th><td id="statMax">--</td></tr>
-                    <tr><th>P5</th><td id="statP5">--</td></tr>
-                    <tr><th>P95</th><td id="statP95">--</td></tr>
-                    <tr><th class="limit-usl">USL</th><td id="statUsl" class="limit-usl">--</td></tr>
-                    <tr><th class="limit-lsl">LSL</th><td id="statLsl" class="limit-lsl">--</td></tr>
-                    <tr class="cp-row"><th>Cp</th><td id="statCp">--</td></tr>
-                    <tr class="cp-row"><th>Cpk</th><td id="statCpk">--</td></tr>
+                    <tr><th class="limit-lsl">LSL</th><td id="pdLsl" class="limit-lsl">--</td></tr>
+                    <tr><th>Target</th><td id="pdTarget">--</td></tr>
+                    <tr><th class="limit-usl">USL</th><td id="pdUsl" class="limit-usl">--</td></tr>
+                    <tr><th>Média Amostral</th><td id="pdMean">--</td></tr>
+                    <tr><th>N Amostral</th><td id="pdN">--</td></tr>
+                    <tr><th>DesvPad (Overall)</th><td id="pdStdOverall">--</td></tr>
+                    <tr><th>DesvPad (Within)</th><td id="pdStdWithin">--</td></tr>
                 </table>
+            </div>
+
+            <div class="minitab-chart-wrap">
+                <canvas id="spcChart"></canvas>
+                <div id="spcClippedNote" class="dist-clipped-note" hidden></div>
+            </div>
+
+            <div class="minitab-capability">
+                <div class="cap-box">
+                    <div class="stats-title">CAPACIDADE GERAL (OVERALL)</div>
+                    <table class="stats-table">
+                        <tr><th>Pp</th><td id="capPp">--</td></tr>
+                        <tr><th>PPL</th><td id="capPpl">--</td></tr>
+                        <tr><th>PPU</th><td id="capPpu">--</td></tr>
+                        <tr class="cp-row"><th>Ppk</th><td id="capPpk">--</td></tr>
+                        <tr><th>Cpm</th><td id="capCpm">--</td></tr>
+                    </table>
+                </div>
+                <div class="cap-box">
+                    <div class="stats-title">CAPACIDADE POTENCIAL (WITHIN)</div>
+                    <table class="stats-table">
+                        <tr><th>Cp</th><td id="capCp">--</td></tr>
+                        <tr><th>CPL</th><td id="capCpl">--</td></tr>
+                        <tr><th>CPU</th><td id="capCpu">--</td></tr>
+                        <tr class="cp-row"><th>Cpk</th><td id="capCpk">--</td></tr>
+                    </table>
+                </div>
                 <div id="cpkBadge" class="cpk-badge" style="display:none"></div>
             </div>
+        </div>
+
+        <div class="minitab-distribution-grid">
+            <div class="minitab-dist-panel">
+                <div class="stats-title">PROBABILITY PLOT (NORMAL) <span id="ppAdStat" class="dist-substat"></span></div>
+                <div class="minitab-chart-wrap dist-chart-wrap">
+                    <canvas id="probabilityPlotChart"></canvas>
+                </div>
+            </div>
+            <div class="minitab-dist-panel">
+                <div class="stats-title">BOXPLOT <span id="bxOutlierCount" class="dist-substat"></span></div>
+                <div class="minitab-chart-wrap dist-chart-wrap">
+                    <canvas id="boxplotChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div class="minitab-performance">
+            <div class="stats-title">DESEMPENHO (PPM)</div>
+            <table class="stats-table perf-table">
+                <thead>
+                    <tr><th></th><th>Observado</th><th>Esp. Overall</th><th>Esp. Within</th></tr>
+                </thead>
+                <tbody>
+                    <tr><th>PPM &lt; LSL</th><td id="perfBelowObs">--</td><td id="perfBelowOverall">--</td><td id="perfBelowWithin">--</td></tr>
+                    <tr><th>PPM &gt; USL</th><td id="perfAboveObs">--</td><td id="perfAboveOverall">--</td><td id="perfAboveWithin">--</td></tr>
+                    <tr><th>PPM Total</th><td id="perfTotalObs">--</td><td id="perfTotalOverall">--</td><td id="perfTotalWithin">--</td></tr>
+                </tbody>
+            </table>
         </div>
 
         <div class="settings-actions">
@@ -286,6 +339,8 @@
             <strong>LSL/USL</strong> vêm automaticamente do cabeçalho do CSV (schema do modelo,
             capturado pelo MES Client). Edite para sobrescrever manualmente; deixe vazio para
             voltar ao automático. Sem limite conhecido no schema, usa μ ± 3σ (marcado "auto").
+            <strong>Comentário</strong> é uma anotação livre por step (ex.: causa raiz, ação
+            combinada) — salva ao sair do campo, independente do LSL/USL.
         </p>
 
         <div class="cm-table-wrap">
@@ -298,6 +353,7 @@
                         <th>LSL</th>
                         <th>USL</th>
                         <th>Cpk</th>
+                        <th>Comentário</th>
                         <th>Ação</th>
                     </tr>
                 </thead>
@@ -342,6 +398,6 @@
     </div>
 </div>
 
-<script src="{% static 'dashboard/js/dashboard.js' %}?v=20260715_01"></script>
+<script src="{% static 'dashboard/js/dashboard.js' %}?v=20260718_01"></script>
 </body>
 </html>

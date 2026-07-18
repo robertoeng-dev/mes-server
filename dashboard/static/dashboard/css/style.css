@@ -588,7 +588,7 @@ body.mode-analise .matrix-toggle {
 
 /* Modal de Cp/Cpk de todos os steps — mais largo (mais colunas) e mais alto */
 .settings-modal.step-specs-manager {
-    width: min(920px, 96vw);
+    width: min(1080px, 96vw);
 }
 
 .step-specs-manager .cm-table-wrap {
@@ -597,6 +597,17 @@ body.mode-analise .matrix-toggle {
 
 .step-specs-manager .cm-limit-input {
     width: 90px;
+}
+
+.step-comment-input {
+    width: 100%;
+    min-width: 160px;
+    padding: 4px 6px;
+    background: #1f2937;
+    color: white;
+    border: 1px solid #374151;
+    border-radius: 4px;
+    font-size: 11px;
 }
 
 .step-specs-manager .cm-status {
@@ -711,31 +722,109 @@ body.mode-analise .matrix-toggle {
     color: #ffffff;
 }
 
-/* Modal de distribuição paramétrica (EEData/SPC): histograma + Cp/Cpk */
-.settings-modal.spc-modal {
-    width: min(900px, 94vw);
+/* Relatório de Capacidade de Processo (EEData/SPC, estilo Minitab):
+   dados do processo | histograma com curvas Overall/Within | capacidade */
+.settings-modal.spc-modal.minitab-report {
+    width: min(1080px, 96vw);
 }
 
-.spc-layout {
+.minitab-grid {
+    display: grid;
+    grid-template-columns: 190px 1fr 200px;
+    gap: 14px;
+    align-items: start;
+}
+
+.minitab-process-data,
+.minitab-capability {
     display: flex;
-    gap: 16px;
-    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
 }
 
-.spc-chart-wrap {
-    flex: 1;
+.minitab-chart-wrap {
     min-width: 0;
-    height: 340px;
+    height: 320px;
     position: relative;
 }
 
-.spc-chart-wrap canvas {
-    height: 340px !important;
+.minitab-chart-wrap canvas {
+    height: 320px !important;
 }
 
-.spc-stats {
-    width: 220px;
-    flex-shrink: 0;
+.cap-box + .cap-box {
+    margin-top: 2px;
+}
+
+.minitab-performance {
+    margin-top: 14px;
+}
+
+.perf-table th,
+.perf-table td {
+    text-align: center;
+}
+
+.perf-table thead th {
+    background: #4c1d95;
+    color: #ffffff;
+}
+
+.perf-table tbody th {
+    text-align: left;
+}
+
+/* Probability Plot + Boxplot — segunda linha do relatório, mesmo padrão
+   visual do histograma acima (dark theme, título roxo, canvas 320px) */
+.minitab-distribution-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-top: 14px;
+}
+
+.minitab-dist-panel {
+    display: flex;
+    flex-direction: column;
+}
+
+.dist-chart-wrap {
+    min-width: 0;
+    height: 280px;
+    position: relative;
+}
+
+.dist-chart-wrap canvas {
+    height: 280px !important;
+}
+
+.dist-substat {
+    color: #94a3b8;
+    font-weight: normal;
+    letter-spacing: normal;
+    font-size: 11px;
+}
+
+.dist-clipped-note {
+    position: absolute;
+    bottom: 4px;
+    right: 8px;
+    font-size: 10px;
+    color: #fbbf24;
+    background: rgba(15, 23, 42, 0.85);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid rgba(251, 191, 36, 0.4);
+}
+
+@media (max-width: 1100px) {
+    .minitab-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .minitab-distribution-grid {
+        grid-template-columns: 1fr;
+    }
 }
 
 .stats-title {
@@ -832,15 +921,6 @@ body.mode-analise .matrix-toggle {
     border: 1px solid #ef4444;
 }
 
-@media (max-width: 1100px) {
-    .spc-layout {
-        flex-direction: column;
-    }
-
-    .spc-stats {
-        width: 100%;
-    }
-}
 
 .panel-expand-btn:hover {
     background: #334155;

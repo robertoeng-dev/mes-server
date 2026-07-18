@@ -19,4 +19,5 @@ urlpatterns = [
     path("api/spc/distribution/", views.api_spc_distribution, name="api_spc_distribution"),
     path("api/spc/overview/", views.api_spc_overview, name="api_spc_overview"),
     path("api/spc/specs/set/", views.api_spc_spec_set, name="api_spc_spec_set"),
+    path("api/export/xlsx/", views.api_export_xlsx, name="api_export_xlsx"),
 ]

@@ -1,7 +1,8 @@
+import datetime
 import json
 
 from django.shortcuts import render
-from django.http import JsonResponse, HttpResponseBadRequest
+from django.http import JsonResponse, HttpResponseBadRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
@@ -70,22 +71,19 @@ def api_spc_distribution(request):
     if not step:
         return JsonResponse({"error": "step parameter required"}, status=400)
 
-    usl = request.GET.get("usl") or None
-    lsl = request.GET.get("lsl") or None
-
-    if usl is not None:
+    def parse_float_or_none(raw):
+        if not raw:
+            return None
         try:
-            usl = float(usl)
+            return float(raw)
         except ValueError:
-            usl = None
+            return None
 
-    if lsl is not None:
-        try:
-            lsl = float(lsl)
-        except ValueError:
-            lsl = None
+    usl = parse_float_or_none(request.GET.get("usl"))
+    lsl = parse_float_or_none(request.GET.get("lsl"))
+    target = parse_float_or_none(request.GET.get("target"))
 
-    return JsonResponse(services.parametric_distribution(filters, step, usl, lsl))
+    return JsonResponse(services.parametric_distribution(filters, step, usl, lsl, target))
 
 
 def api_spc_overview(request):
@@ -113,13 +111,25 @@ def api_spc_spec_set(request):
         except (TypeError, ValueError):
             return None
 
-    usl = to_float_or_none(body.get("usl"))
-    lsl = to_float_or_none(body.get("lsl"))
-    unit = body.get("unit")
-    unit = str(unit)[:16] if unit else None
+    # Só inclui no update os campos que realmente vieram no corpo da
+    # requisição — editar LSL/USL não deve apagar um comentário já salvo
+    # (e vice-versa). Ver set_step_spec().
+    fields = {}
+    if "usl" in body:
+        fields["usl"] = to_float_or_none(body.get("usl"))
+    if "lsl" in body:
+        fields["lsl"] = to_float_or_none(body.get("lsl"))
+    if "unit" in body:
+        unit = body.get("unit")
+        fields["unit"] = str(unit)[:16] if unit else None
+    if "comment" in body:
+        comment = body.get("comment")
+        fields["comment"] = str(comment)[:500] if comment else None
 
-    services.set_step_spec(step, usl=usl, lsl=lsl, unit=unit)
-    return JsonResponse({"ok": True, "step": step, "usl": usl, "lsl": lsl, "unit": unit})
+    if fields:
+        services.set_step_spec(step, **fields)
+
+    return JsonResponse({"ok": True, "step": step, **fields})
 
 
 @csrf_exempt
@@ -165,3 +175,19 @@ def api_carrier_limit(request):
 
     services.set_carrier_limit(carrier, limit)
     return JsonResponse({"ok": True, "carrier": carrier, "limit": limit})
+
+
+def api_export_xlsx(request):
+    filters = services.get_filters(request)
+    result = services.export_dataset_xlsx(filters)
+
+    if "file_bytes" not in result:
+        return JsonResponse({"error": result.get("error"), "count": result.get("count", 0)}, status=400)
+
+    response = HttpResponse(
+        result["file_bytes"],
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    filename = f"mes_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response

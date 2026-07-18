@@ -408,6 +408,225 @@ re-parsing CSVs or hardcoding limits:
   have data, and grows automatically to the ~38 real ones instead of missing
   most of them (`R1T`, `STC`, `DOCD2`, etc. weren't in the old hardcoded list).
 
+## EEData / SPC: Minitab-style Process Capability Report + per-step comments (2026-07-17)
+
+The single-step detail modal (`#spcOverlay`, `renderSpcPanel()`) was rebuilt
+to match Minitab's "Process Capability Report" layout, at the user's
+explicit request (they attached a real Minitab screenshot as the target).
+Three boxes plus a histogram, not the old single stats table:
+
+- **Dados do Processo** (left): LSL, Target (optional — new `spcTarget`
+  sidebar input, only used for Cpm), USL, sample mean, sample N, and now
+  **two** standard deviations shown side by side.
+- **Histogram** (center): bars as before, plus **two fitted normal curves**
+  overlaid — "Overall" (solid) and "Within" (dashed) — evaluated at each
+  bin's center (`curve_x`/`curve_overall`/`curve_within` in the API
+  response) and scaled by `n * bin_width * norm.pdf(...)` so the curve
+  height visually matches the bars. Chart.js mixed dataset (`type: "bar"`
+  + two `type: "line"`) on one categorical x-axis — the curve is only as
+  smooth as `n_bins` (30), not a continuous line like real Minitab, which
+  is an accepted simplification for a modal-sized chart.
+- **Capacidade Geral (Overall)** and **Capacidade Potencial (Within)**
+  (right, stacked): this is the one place the naming is *not* a typo —
+  Minitab's convention is that **Pp/Ppk use the Overall (long-term, plain
+  sample) standard deviation, and Cp/Cpk use the Within (short-term)
+  standard deviation** — the opposite of what "Cp/Cpk" meant everywhere
+  else in this codebase before today. `services._capability_indices(usl,
+  lsl, mean, sigma)` is the one shared formula; which sigma you pass in
+  decides whether you get Pp/Ppk-flavored or Cp/Cpk-flavored numbers.
+  Cpm (needs a Target) sits in the Overall box, using Overall sigma.
+- **Desempenho (PPM)** table (bottom): Observado (empirical count of
+  `values < LSL` / `> USL`) vs. Esp. Overall / Esp. Within (theoretical,
+  via `scipy.stats.norm.cdf` assuming normality at each sigma) — the four
+  numbers together are what let an engineer judge "is the process actually
+  behaving normally, or is the theoretical PPM way off from observed?".
+
+**"Within" sigma comes from the moving range, not real subgroups.** This
+line only has individual measurements, not rational subgroups, so
+short-term variation is estimated the standard SPC way for individuals data
+(I-MR chart convention): `std_within = mean(|x[i] - x[i-1]|) / 1.128`
+(`MOVING_RANGE_D2`), computed over the data **in event_time order** — this
+is why `parametric_distribution()`'s query changed from no `ORDER BY` to
+`ORDER BY {event_time}, id`.
+
+**Real bug #1 — non-deterministic Cpk, found via repeated identical
+requests returning different numbers.** Many rows share the same
+`event_time` down to the second (bursts from one CSV read). `ORDER BY
+event_time` alone doesn't break those ties deterministically — Postgres is
+free to return tied rows in a different physical order on different runs of
+the *same* query, so the moving range (which is order-dependent) computed a
+different `std_within` — and therefore a different Cpk — on every identical
+call. Fixed by adding the primary key as a stable secondary sort key:
+`ORDER BY event_time, id`. Confirmed via 5 back-to-back identical requests
+returning the exact same value only after this fix — **if you ever see a
+Cpk-style metric fluctuate across repeated identical requests, suspect an
+unstable `ORDER BY` over data with duplicate sort keys before anything
+else.** Same fix applied to `step_cpk_overview()`'s window-function query
+(see below).
+
+**Real bug #2 — the overview table's Cpk didn't match the detail view's Cpk
+for the same step/filter**, found by comparing screenshots side by side.
+`step_cpk_overview()` originally computed capability using plain
+`STDDEV_SAMP` (i.e. Overall/Ppk-style sigma) for its one "Cpk" column, while
+the newly-Minitab'd detail view uses Within sigma for "Cpk" — so a step
+could show "INCAPAZ" (red) in the table and "ACEITÁVEL"/"BOM" the moment you
+clicked "Detalhar" on that exact row. Fixed by computing the moving range
+per step too, in the **same** single query (a `LAG() OVER (PARTITION BY
+step_key ORDER BY event_time, id)` window function inside the existing
+`jsonb_each_text` unpivot — still one query for all ~38 steps, not one per
+step) and feeding `std_within` into `_capability_indices()`, the same shared
+helper the detail view uses. The two now agree by construction, not by
+coincidence — if you touch either capability calculation, check the other
+still matches for at least one step before considering it done.
+
+**Per-step comment column.** `dashboard_step_specs` gained a `comment TEXT`
+column (via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, since the table
+already existed in deployed databases before this column was added —
+`CREATE TABLE IF NOT EXISTS` alone would not have retrofitted it).
+`services.set_step_spec(step_key, **fields)` was changed from a fixed
+`(usl, lsl, unit)` signature to `**fields` with a per-call dynamic `SET`
+clause — **only the keys actually passed are updated**, everything else
+in that row is left alone. This matters: the LSL/USL inputs and the new
+comment `<input>` in the overview table (`dashboard.js`) save independently
+on their own `change` events, via separate `POST /api/spc/specs/set/`
+calls with different JSON bodies (`{step, lsl, usl}` vs. `{step, comment}`).
+Before this redesign, a single fixed-column upsert would have silently
+wiped out an existing comment the next time someone tweaked that step's LSL
+— **don't go back to a fixed-signature `set_step_spec()`, the partial-update
+`**fields` design is load-bearing, not incidental.** The comment textbox
+value is escaped via a small `escapeHtmlAttr()` helper before being embedded
+into the table's `innerHTML` (it's free-typed text re-displayed to other
+users, needs XSS-safe escaping same as any reflected user input).
+
+## Performance fixes + Distribution panels (Probability Plot/Boxplot) + Excel export (2026-07-18)
+
+Three combined asks in one session: the dashboard felt "frozen" on load, the
+Process Capability histogram's X-axis was unreadable whenever an outlier sat
+near zero, and a request for an Excel export of the current filter for
+external Minitab analysis.
+
+**Performance — three real bottlenecks found by measuring, not guessing.**
+1. `initDashboard()` used to `await refreshStepSpecsOverview()` (the full
+   Cp/Cpk-of-all-steps query) sequentially before anything else rendered —
+   18.5s blocking the ENTIRE page load even though nothing else displayed
+   depends on it. Removed from the load sequence; the overview modal already
+   reloads it independently when opened. The `stepSelect` dropdown, which
+   relied on that same call to populate, now gets a cheap schema-only list
+   (`discover_step_candidates()`, no `mes_test_results` scan) via a new
+   `step_candidates` field on `/api/filters/`.
+2. `debug_info()` computed `COUNT(*)` + 2×`COUNT(DISTINCT ...)` on every call
+   (every 60s auto-refresh) for 3 fields (`total_rows`/`stations`/`models`)
+   that — confirmed via grep — no frontend code reads. Removed; only
+   `last_created_at`/`last_event_time` remain.
+3. `loadCarrierCycles()` (10-15s, full-table scan + window function) used to
+   run inside `loadDashboard()`'s `Promise.all` on every 60s refresh. Given
+   its own 5-minute timer (`applyCarrierCyclesInterval()`) and taken out of
+   the main await chain (fired without `await` at page load) so it doesn't
+   block the rest of the dashboard from becoming interactive.
+4. `distinct_filters()` (backs `/api/filters/`, awaited FIRST in
+   `initDashboard()`) measured **12.4s** — the `carrier` expression alone
+   (`dedupe_doubled_scan` + multi-key `COALESCE`) cost 6.5s for just 4
+   distinct values. Added a simple in-process cache
+   (`_DISTINCT_FILTERS_CACHE`, 5-minute TTL) — station/model/carrier/failure
+   lists change slowly, so a few-minutes-stale list is a non-issue and this
+   turns "12s every page load" into "12s once per 5 minutes."
+5. `step_cpk_overview()`'s `jsonb_each_text`-based unpivot (measured 18.5s)
+   had a non-obvious root cause: the unpivot itself only cost ~1.9s
+   (confirmed via `EXPLAIN ANALYZE` in isolation) — the real cost was the
+   `LAG() OVER (PARTITION BY step_key ORDER BY event_time, id)` window
+   function needing to sort the ~1.3M-row unpivoted result, which overflowed
+   `work_mem` and spilled to disk (~24s for that sort alone in one variant).
+   **Several rewrites were tried and measured before finding one that
+   actually helped**: `UNION ALL` per step (103s — turned "N scans folded
+   into one query" into N *separate* sequential scans of the base table);
+   `LATERAL VALUES` per-row projection (58s — same window-sort problem,
+   still expanding to ~1.3M rows before the sort); forcing the base CTE
+   `MATERIALIZED` (17s — confirmed the `event_time` expression wasn't the
+   dominant cost); raising `work_mem` (16s — the sort is expensive even in
+   memory). What actually worked: `jsonb_to_record(row_data)` requesting
+   only the known step keys as **typed columns** (no unpivot, no row
+   multiplication — Postgres extracts just those keys, in C, per row), then
+   computing mean/stddev/moving-range **in pandas** after fetching (one sort
+   of 37,685 rows, not 1.3M). Net **18.5s → ~11s**, and this query is no
+   longer on the page-load path at all (fix #1) — the practical impact is
+   larger than the raw number suggests. If a future session is tempted to
+   "optimize" this further with another SQL rewrite, **measure it first** —
+   this function's history is a good case study in "the obvious unpivot
+   isn't the bottleneck, the sort is."
+
+**Minitab-style Distribution panels (Probability Plot + Boxplot), alongside
+the existing Process Capability histogram** — all in `parametric_distribution()`:
+- **Histogram X-axis fix** (the reported bug): bins no longer span raw
+  `values.min()`/`max()`. The range is now the *narrower* of (1st-99th
+  percentile) or (μ±4σ), always widened to include LSL/USL/target. Points
+  outside that window still count in every statistic/PPM figure — they just
+  don't warp the visual bin width anymore. `clipped_below`/`clipped_above`
+  counts are returned and shown as a small note under the histogram so
+  nothing is silently hidden.
+- **Probability Plot**: Benard plotting positions (`(i-0.3)/(n+0.4)`),
+  z-scores via `scipy.stats.norm.ppf`, a fitted normal reference line
+  (`mean + std_overall*z`), and an **exact** 95% confidence band via the
+  Beta distribution of order statistics (`F(x_(i)) ~ Beta(i, n+1-i)`, not a
+  normal-approximation of the standard error) — same construction Minitab
+  and R's `car::qqPlot` use. Anderson-Darling statistic + p-value via the
+  D'Agostino & Stephens (1986) 4-branch piecewise formula. **Real bug found
+  and fixed**: for strongly non-normal data (a tight cluster plus a handful
+  of near-zero outliers — genuinely occurs in this dataset, e.g. steps UV2/
+  PACK), AD* can reach the thousands; the top branch's formula has a
+  quadratic term that *overtakes* the linear term above AD*≈153, so
+  `exp(...)` overflowed to `inf`, and `np.clip(inf, 0, 1)` silently clamped
+  it down to **`p=1.0`** — reporting "perfectly normal" for the single most
+  non-normal case possible. Fixed with an explicit `AD* > 20 → p = 0.0`
+  short-circuit (the polynomial already gives ~3e-46 there — a
+  domain-of-validity guard, not a hack). **If a goodness-of-fit p-value ever
+  comes back exactly 1.0 next to a huge test statistic, suspect this same
+  overflow-then-clip failure mode** — it's not specific to Anderson-Darling.
+  Up to 2000 points are sent to the frontend (uniformly sampled by rank) for
+  render performance, but the Beta CI / AD stat always use the full sample.
+- **Boxplot**: standard Tukey 5-number summary + 1.5×IQR fences; each
+  outlier tagged `out_of_spec` (red) vs. `statistical` (amber) depending on
+  whether it's outside LSL/USL — a more direct "easy visual ID of
+  out-of-spec data" than the histogram can give.
+- **Frontend**: no new CDN dependency — the boxplot is a Chart.js
+  floating-bar dataset (`[q1, q3]`) plus a small inline (`plugins: [...]`,
+  not globally registered) canvas-2D plugin for whiskers/median/outlier
+  dots/spec lines, matching how LSL/USL lines are already drawn elsewhere in
+  this codebase, instead of pulling in `@sgratzl/chartjs-chart-boxplot` (a
+  fork of an archived project).
+
+**Excel export** (`/api/export/xlsx/`, `services.export_dataset_xlsx()`):
+wide-format `.xlsx` of the current filter — metadata (event_time/station/
+model/carrier/channel/result) + every known parametric step as a column, one
+row per test. Row-capped at 100,000 (returns HTTP 400 with a clear message
+asking to narrow the filter, never a partial/truncated file). No genuine
+per-unit serial exists at the PCM_TESTER stage (`barcode` = carrier, reused
+across many boards; `device_name` = fixture serial, not the part) — the
+exported `Unit_ID` column is an explicitly-labeled **synthetic** composite
+(`carrier_ch{channel}_{row id}`), not a real serial, sufficient to
+cross-reference rows in Minitab/Excel without pretending to be something it
+isn't.
+
+**Real perf bug in the export path, found the same way as item 5 above — by
+measuring, not guessing.** `pandas.DataFrame.to_excel()` (regardless of
+`engine="openpyxl"` vs `engine="xlsxwriter"` — tried both) iterates the
+dataframe cell-by-cell in pure Python for styling/type-dispatch; on this
+dataset's shape (37,685 rows × ~183 columns unfiltered) that took **112s** —
+the SQL fetch itself was only ~6-7s. Bypassing `to_excel()` and writing
+directly via `xlsxwriter.Workbook(..., {"constant_memory": True})` +
+`worksheet.write_row()` per row (converting the dataframe to a plain
+list-of-lists first, with NaN→`None` via `.astype(object).where(...)` —
+assigning `None` into a still-`float64` column silently reverts to `NaN`,
+has to be object-dtype first) dropped this to **~22s**. A second bug from
+this same bypass: writing a raw Python `datetime` via `write_row()` with no
+format applied writes the **Excel serial number** (e.g. `46105.362708`), not
+a readable date — `to_excel()` normally handles this invisibly. Fixed by
+pre-formatting `event_time` to a `"%Y-%m-%d %H:%M:%S"` string column before
+handing rows to xlsxwriter, rather than threading a `num_format` through the
+low-level per-row API. `requirements.txt` ended up with `xlsxwriter`, not
+`openpyxl` (added first, then replaced once the performance problem was
+found) — remember this file is **UTF-16LE with BOM and CRLF** (`file
+requirements.txt` to confirm), a plain UTF-8 write will corrupt it for pip.
+
 ## Deploy — factory rollout planned 2026-07-16
 
 Both repos are being packaged together for a factory deploy the day after

@@ -2,6 +2,8 @@ let topFailuresChart = null;
 let hourlyYieldChart = null;
 let channelsChart = null;
 let spcChart = null;
+let probabilityPlotChart = null;
+let boxplotChart = null;
 
 if (window.ChartDataLabels) {
     Chart.register(ChartDataLabels);
@@ -39,6 +41,17 @@ function loadConfig() {
 
 let config = loadConfig();
 let refreshTimer = null;
+let carrierCyclesTimer = null;
+
+// Ciclos de vida do carrier mudam devagar (contador cumulativo) — atualizar
+// a cada 5 minutos é suficiente e evita repetir, a cada ciclo de 60s do
+// dashboard, uma consulta que varre o histórico inteiro de cada carrier.
+const CARRIER_CYCLES_REFRESH_MS = 5 * 60 * 1000;
+
+function applyCarrierCyclesInterval() {
+    if (carrierCyclesTimer) clearInterval(carrierCyclesTimer);
+    carrierCyclesTimer = setInterval(loadCarrierCycles, CARRIER_CYCLES_REFRESH_MS);
+}
 
 // Modo de operação: "online" (tempo real, chão de fábrica) ou "analise"
 // (investigação com filtros completos). Persistido por navegador.
@@ -403,6 +416,15 @@ function renderCarrierManager() {
 // EEData / SPC — distribuição paramétrica (histograma + Cp/Cpk) de um step
 // ---------------------------------------------------------------------------
 
+// Escapa texto livre (ex.: comentário do usuário) antes de embutir num
+// atributo value="..." via innerHTML — evita quebrar o HTML ou permitir
+// injeção via aspas/tags dentro do texto salvo.
+function escapeHtmlAttr(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML.replace(/"/g, "&quot;");
+}
+
 // Classificação de Cpk compartilhada entre o modal de detalhe (um step) e a
 // visão geral (todos os steps) — mesmos limiares em um único lugar.
 function cpkClassify(cpk) {
@@ -426,11 +448,13 @@ async function loadSpcDistribution() {
 
     const usl = document.getElementById("spcUsl").value;
     const lsl = document.getElementById("spcLsl").value;
+    const target = document.getElementById("spcTarget").value;
 
     const params = new URLSearchParams(getFiltersQuery());
     params.set("step", step);
     if (usl) params.set("usl", usl);
     if (lsl) params.set("lsl", lsl);
+    if (target) params.set("target", target);
 
     try {
         const data = await fetchJson(`/api/spc/distribution/?${params.toString()}`);
@@ -440,37 +464,80 @@ async function loadSpcDistribution() {
     }
 }
 
+function fmtStat(value, digits) {
+    return value != null ? Number(value).toFixed(digits ?? 6) : "--";
+}
+
+function fmtPpm(value) {
+    return value != null ? Number(value).toLocaleString("pt-BR", { maximumFractionDigits: 2 }) : "--";
+}
+
+// Relatório de Capacidade de Processo (estilo Minitab): dados do processo à
+// esquerda, histograma com curvas Overall/Within ao centro, capacidade
+// Overall (Pp/Ppk) e Potencial/Within (Cp/Cpk) à direita, PPM embaixo.
 function renderSpcPanel(data) {
     document.getElementById("spcStepLabel").textContent = data.step || "--";
 
-    const stats = data.stats || {};
-    const limits = data.limits || {};
-    const capability = data.capability || {};
+    const pd = data.process_data || {};
+    const overall = data.overall_capability || {};
+    const potential = data.potential_capability || {};
+    const perf = data.performance || {};
     const n = data.count || 0;
 
-    document.getElementById("statCount").textContent = n.toLocaleString("pt-BR");
-    document.getElementById("statMean").textContent = stats.mean != null ? Number(stats.mean).toFixed(6) : "--";
-    document.getElementById("statStd").textContent = stats.std != null ? Number(stats.std).toFixed(6) : "--";
-    document.getElementById("statMin").textContent = stats.min != null ? Number(stats.min).toFixed(6) : "--";
-    document.getElementById("statMax").textContent = stats.max != null ? Number(stats.max).toFixed(6) : "--";
-    document.getElementById("statP5").textContent = stats.p5 != null ? Number(stats.p5).toFixed(6) : "--";
-    document.getElementById("statP95").textContent = stats.p95 != null ? Number(stats.p95).toFixed(6) : "--";
+    const autoTag = pd.limits_auto ? " (auto)" : "";
+    document.getElementById("pdLsl").textContent = pd.lsl != null ? `${fmtStat(pd.lsl, 4)}${autoTag}` : "--";
+    document.getElementById("pdUsl").textContent = pd.usl != null ? `${fmtStat(pd.usl, 4)}${autoTag}` : "--";
+    document.getElementById("pdTarget").textContent = pd.target != null ? fmtStat(pd.target, 4) : "*";
+    document.getElementById("pdMean").textContent = fmtStat(pd.mean);
+    document.getElementById("pdN").textContent = (pd.n || n).toLocaleString("pt-BR");
+    document.getElementById("pdStdOverall").textContent = fmtStat(pd.std_overall);
+    document.getElementById("pdStdWithin").textContent = fmtStat(pd.std_within);
 
-    const auto = limits.auto ? " (auto)" : "";
-    document.getElementById("statUsl").textContent = limits.usl != null ? `${Number(limits.usl).toFixed(6)}${auto}` : "--";
-    document.getElementById("statLsl").textContent = limits.lsl != null ? `${Number(limits.lsl).toFixed(6)}${auto}` : "--";
-    document.getElementById("statCp").textContent = capability.cp != null ? Number(capability.cp).toFixed(3) : "--";
-    document.getElementById("statCpk").textContent = capability.cpk != null ? Number(capability.cpk).toFixed(3) : "--";
+    document.getElementById("capPp").textContent = fmtStat(overall.pp, 3);
+    document.getElementById("capPpl").textContent = fmtStat(overall.ppl, 3);
+    document.getElementById("capPpu").textContent = fmtStat(overall.ppu, 3);
+    document.getElementById("capPpk").textContent = fmtStat(overall.ppk, 3);
+    document.getElementById("capCpm").textContent = overall.cpm != null ? fmtStat(overall.cpm, 3) : "*";
 
+    document.getElementById("capCp").textContent = fmtStat(potential.cp, 3);
+    document.getElementById("capCpl").textContent = fmtStat(potential.cpl, 3);
+    document.getElementById("capCpu").textContent = fmtStat(potential.cpu, 3);
+    document.getElementById("capCpk").textContent = fmtStat(potential.cpk, 3);
+
+    document.getElementById("perfBelowObs").textContent = fmtPpm(perf.observed?.below);
+    document.getElementById("perfAboveObs").textContent = fmtPpm(perf.observed?.above);
+    document.getElementById("perfTotalObs").textContent = fmtPpm(perf.observed?.total);
+    document.getElementById("perfBelowOverall").textContent = fmtPpm(perf.expected_overall?.below);
+    document.getElementById("perfAboveOverall").textContent = fmtPpm(perf.expected_overall?.above);
+    document.getElementById("perfTotalOverall").textContent = fmtPpm(perf.expected_overall?.total);
+    document.getElementById("perfBelowWithin").textContent = fmtPpm(perf.expected_within?.below);
+    document.getElementById("perfAboveWithin").textContent = fmtPpm(perf.expected_within?.above);
+    document.getElementById("perfTotalWithin").textContent = fmtPpm(perf.expected_within?.total);
+
+    // O badge de status usa a capacidade POTENCIAL (Within) — é o "Cpk" de
+    // curto prazo que o Minitab destaca como indicador principal.
     const badge = document.getElementById("cpkBadge");
-    if (capability.cpk != null) {
-        const cpk = Number(capability.cpk);
+    if (potential.cpk != null) {
+        const cpk = Number(potential.cpk);
         const info = cpkClassify(cpk);
         badge.style.display = "";
-        badge.textContent = `Cpk ${cpk.toFixed(3)} — ${info.label}`;
+        badge.textContent = `Cpk (Within) ${cpk.toFixed(3)} — ${info.label}`;
         badge.className = `cpk-badge ${info.cls}`;
     } else {
         badge.style.display = "none";
+    }
+
+    const clippedNote = document.getElementById("spcClippedNote");
+    const clippedBelow = data.clipped_below || 0;
+    const clippedAbove = data.clipped_above || 0;
+    if (clippedBelow || clippedAbove) {
+        const parts = [];
+        if (clippedBelow) parts.push(`${clippedBelow} abaixo`);
+        if (clippedAbove) parts.push(`${clippedAbove} acima`);
+        clippedNote.textContent = `${parts.join(", ")} da faixa exibida (veja Boxplot/Probability Plot)`;
+        clippedNote.hidden = false;
+    } else {
+        clippedNote.hidden = true;
     }
 
     if (spcChart) { spcChart.destroy(); spcChart = null; }
@@ -480,82 +547,101 @@ function renderSpcPanel(data) {
     const bins = data.bins || [];
     const labels = bins.map(b => Number(b.x).toPrecision(4));
     const values = bins.map(b => b.y);
+    const curveOverall = data.curve_overall || [];
+    const curveWithin = data.curve_within || [];
 
     const annotations = {};
-    if (limits.usl != null) {
-        const pos = valueToIndex(limits.usl, bins);
+    if (pd.usl != null) {
+        const pos = valueToIndex(pd.usl, bins);
         annotations.uslLine = {
-            type: "line",
-            xMin: pos, xMax: pos,
-            borderColor: "#ef4444",
-            borderWidth: 2,
-            borderDash: [6, 3],
+            type: "line", xMin: pos, xMax: pos,
+            borderColor: "#ef4444", borderWidth: 2, borderDash: [6, 3],
             label: {
-                display: true,
-                content: `USL ${Number(limits.usl).toFixed(4)}`,
-                position: "start",
-                backgroundColor: "rgba(239,68,68,0.85)",
-                color: "#fff",
-                font: { weight: "bold", size: 11 }
+                display: true, content: `USL ${Number(pd.usl).toFixed(4)}`, position: "start",
+                backgroundColor: "rgba(239,68,68,0.85)", color: "#fff", font: { weight: "bold", size: 11 }
             }
         };
     }
-    if (limits.lsl != null) {
-        const pos = valueToIndex(limits.lsl, bins);
+    if (pd.lsl != null) {
+        const pos = valueToIndex(pd.lsl, bins);
         annotations.lslLine = {
-            type: "line",
-            xMin: pos, xMax: pos,
-            borderColor: "#3b82f6",
-            borderWidth: 2,
-            borderDash: [6, 3],
+            type: "line", xMin: pos, xMax: pos,
+            borderColor: "#3b82f6", borderWidth: 2, borderDash: [6, 3],
             label: {
-                display: true,
-                content: `LSL ${Number(limits.lsl).toFixed(4)}`,
-                position: "start",
-                backgroundColor: "rgba(59,130,246,0.85)",
-                color: "#fff",
-                font: { weight: "bold", size: 11 }
+                display: true, content: `LSL ${Number(pd.lsl).toFixed(4)}`, position: "start",
+                backgroundColor: "rgba(59,130,246,0.85)", color: "#fff", font: { weight: "bold", size: 11 }
             }
         };
     }
-    if (stats.mean != null) {
-        const pos = valueToIndex(stats.mean, bins);
-        annotations.meanLine = {
-            type: "line",
-            xMin: pos, xMax: pos,
-            borderColor: "#f59e0b",
-            borderWidth: 2,
+    if (pd.target != null) {
+        const pos = valueToIndex(pd.target, bins);
+        annotations.targetLine = {
+            type: "line", xMin: pos, xMax: pos,
+            borderColor: "#a855f7", borderWidth: 2, borderDash: [2, 2],
             label: {
-                display: true,
-                content: `μ ${Number(stats.mean).toFixed(4)}`,
-                position: "end",
-                backgroundColor: "rgba(245,158,11,0.85)",
-                color: "#111827",
-                font: { weight: "bold", size: 11 }
+                display: true, content: `Target ${Number(pd.target).toFixed(4)}`, position: "end",
+                backgroundColor: "rgba(168,85,247,0.85)", color: "#fff", font: { weight: "bold", size: 11 }
+            }
+        };
+    }
+    if (pd.mean != null) {
+        const pos = valueToIndex(pd.mean, bins);
+        annotations.meanLine = {
+            type: "line", xMin: pos, xMax: pos,
+            borderColor: "#f59e0b", borderWidth: 2,
+            label: {
+                display: true, content: `μ ${Number(pd.mean).toFixed(4)}`, position: "end",
+                backgroundColor: "rgba(245,158,11,0.85)", color: "#111827", font: { weight: "bold", size: 11 }
             }
         };
     }
 
     const ctx = document.getElementById("spcChart");
     spcChart = new Chart(ctx, {
-        type: "bar",
         data: {
             labels: labels,
-            datasets: [{
-                label: data.step,
-                data: values,
-                backgroundColor: "rgba(99, 102, 241, 0.75)",
-                borderColor: "#818cf8",
-                borderWidth: 1,
-                barPercentage: 1.0,
-                categoryPercentage: 1.0
-            }]
+            datasets: [
+                {
+                    type: "bar",
+                    label: "Frequência",
+                    data: values,
+                    backgroundColor: "rgba(99, 102, 241, 0.75)",
+                    borderColor: "#818cf8",
+                    borderWidth: 1,
+                    barPercentage: 1.0,
+                    categoryPercentage: 1.0,
+                    order: 3
+                },
+                {
+                    type: "line",
+                    label: "Overall",
+                    data: curveOverall,
+                    borderColor: "#f87171",
+                    backgroundColor: "transparent",
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.35,
+                    order: 1
+                },
+                {
+                    type: "line",
+                    label: "Within",
+                    data: curveWithin,
+                    borderColor: "#94a3b8",
+                    backgroundColor: "transparent",
+                    borderWidth: 2,
+                    borderDash: [5, 4],
+                    pointRadius: 0,
+                    tension: 0.35,
+                    order: 2
+                }
+            ]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-                legend: { display: false },
+                legend: { display: true, position: "top", labels: { color: "#cbd5e1", boxWidth: 20, font: { size: 10 } } },
                 datalabels: { display: false },
                 annotation: { annotations }
             },
@@ -573,6 +659,263 @@ function renderSpcPanel(data) {
             }
         }
     });
+
+    renderProbabilityPlot(data);
+    renderBoxplot(data);
+}
+
+// Escala Y do Probability Plot: em vez do z-score cru, mostra os
+// percentuais que o Minitab usa (1%, 5%, 10%... 99%) — pares fixos
+// (z, rótulo), já que não temos scipy no navegador para inverter a normal
+// padrão em tempo real.
+const PROBABILITY_PLOT_Z_TICKS = [
+    { z: -2.326, label: "1%" }, { z: -1.645, label: "5%" }, { z: -1.282, label: "10%" },
+    { z: -0.842, label: "20%" }, { z: -0.524, label: "30%" }, { z: -0.253, label: "40%" },
+    { z: 0, label: "50%" },
+    { z: 0.253, label: "60%" }, { z: 0.524, label: "70%" }, { z: 0.842, label: "80%" },
+    { z: 1.282, label: "90%" }, { z: 1.645, label: "95%" }, { z: 2.326, label: "99%" }
+];
+
+function renderProbabilityPlot(data) {
+    if (probabilityPlotChart) { probabilityPlotChart.destroy(); probabilityPlotChart = null; }
+
+    const pp = data.probability_plot || {};
+    const points = pp.points || [];
+    const normality = data.normality || {};
+
+    const adText = normality.ad_stat != null
+        ? `AD=${Number(normality.ad_stat).toFixed(3)}  P=${Number(normality.ad_pvalue).toFixed(3)}`
+        : "";
+    document.getElementById("ppAdStat").textContent = adText;
+
+    if (!points.length) return;
+
+    const inSpecPoints = points.filter(p => !p.out_of_spec).map(p => ({ x: p.x, y: p.z }));
+    const oosPoints = points.filter(p => p.out_of_spec).map(p => ({ x: p.x, y: p.z }));
+    const fitLine = (pp.fit_line || []).map(p => ({ x: p.x, y: p.z }));
+    const ciLower = (pp.ci_lower || []).map(p => ({ x: p.x, y: p.z }));
+    const ciUpper = (pp.ci_upper || []).map(p => ({ x: p.x, y: p.z }));
+
+    const ctx = document.getElementById("probabilityPlotChart");
+    probabilityPlotChart = new Chart(ctx, {
+        type: "scatter",
+        data: {
+            datasets: [
+                {
+                    label: "Dentro da spec",
+                    data: inSpecPoints,
+                    backgroundColor: "rgba(129, 140, 248, 0.75)",
+                    pointRadius: 3,
+                    showLine: false
+                },
+                {
+                    label: "Fora da spec",
+                    data: oosPoints,
+                    backgroundColor: "#ef4444",
+                    pointRadius: 4,
+                    pointStyle: "triangle",
+                    showLine: false
+                },
+                {
+                    label: "Ajuste (Normal)",
+                    data: fitLine,
+                    type: "line",
+                    borderColor: "#f87171",
+                    backgroundColor: "transparent",
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    showLine: true
+                },
+                {
+                    label: "IC 95%",
+                    data: ciLower,
+                    type: "line",
+                    borderColor: "rgba(148, 163, 184, 0.6)",
+                    backgroundColor: "transparent",
+                    borderWidth: 1,
+                    borderDash: [4, 3],
+                    pointRadius: 0,
+                    showLine: true
+                },
+                {
+                    label: "IC 95% (sup)",
+                    data: ciUpper,
+                    type: "line",
+                    borderColor: "rgba(148, 163, 184, 0.6)",
+                    backgroundColor: "transparent",
+                    borderWidth: 1,
+                    borderDash: [4, 3],
+                    pointRadius: 0,
+                    showLine: true
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    display: true, position: "top",
+                    labels: {
+                        color: "#cbd5e1", boxWidth: 12, font: { size: 9 },
+                        filter: item => item.text !== "IC 95% (sup)"
+                    }
+                },
+                datalabels: { display: false }
+            },
+            scales: {
+                x: {
+                    type: "linear",
+                    title: { display: true, text: data.step, color: "#94a3b8" },
+                    ticks: { color: "#94a3b8" },
+                    grid: { color: "rgba(148, 163, 184, 0.08)" }
+                },
+                y: {
+                    title: { display: true, text: "Percentual", color: "#94a3b8" },
+                    afterBuildTicks: axis => {
+                        axis.ticks = PROBABILITY_PLOT_Z_TICKS.map(t => ({ value: t.z }));
+                    },
+                    ticks: {
+                        color: "#94a3b8",
+                        callback: value => {
+                            const tick = PROBABILITY_PLOT_Z_TICKS.find(t => Math.abs(t.z - value) < 0.001);
+                            return tick ? tick.label : "";
+                        }
+                    },
+                    grid: { color: "rgba(148, 163, 184, 0.08)" }
+                }
+            }
+        }
+    });
+}
+
+// Plugin inline (não registrado globalmente) que desenha hastes, mediana e
+// outliers de um boxplot horizontal de UMA variável só — não há biblioteca
+// de boxplot já carregada no projeto (chartjs-chart-boxplot é um fork de um
+// projeto arquivado); reaproveita os primitivos do Chart.js (barra
+// flutuante + canvas 2D) que já são usados para as linhas de LSL/USL.
+function boxplotDecorationsPlugin(bx, lsl, usl, target) {
+    return {
+        id: "boxplotDecorations",
+        afterDraw(chart) {
+            const { ctx, scales } = chart;
+            const xScale = scales.x;
+            const y = chart.getDatasetMeta(0).data[0]?.y;
+            if (y == null) return;
+
+            const toPx = value => xScale.getPixelForValue(value);
+            const capHalf = 10;
+
+            ctx.save();
+
+            // Hastes: Q1→whisker_low e Q3→whisker_high, com "tampa" nas pontas
+            ctx.strokeStyle = "#94a3b8";
+            ctx.lineWidth = 1.5;
+            [[bx.whisker_low, bx.q1], [bx.q3, bx.whisker_high]].forEach(([from, to]) => {
+                ctx.beginPath();
+                ctx.moveTo(toPx(from), y);
+                ctx.lineTo(toPx(to), y);
+                ctx.stroke();
+            });
+            [bx.whisker_low, bx.whisker_high].forEach(v => {
+                ctx.beginPath();
+                ctx.moveTo(toPx(v), y - capHalf);
+                ctx.lineTo(toPx(v), y + capHalf);
+                ctx.stroke();
+            });
+
+            // Mediana: traço vertical dentro da caixa
+            ctx.strokeStyle = "#f59e0b";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(toPx(bx.median), y - capHalf);
+            ctx.lineTo(toPx(bx.median), y + capHalf);
+            ctx.stroke();
+
+            // Limites de especificação, mesmas cores do histograma
+            const specLines = [[lsl, "#3b82f6"], [usl, "#ef4444"]];
+            if (target != null) specLines.push([target, "#a855f7"]);
+            specLines.forEach(([value, color]) => {
+                if (value == null) return;
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                ctx.setLineDash([6, 3]);
+                ctx.beginPath();
+                ctx.moveTo(toPx(value), chart.chartArea.top);
+                ctx.lineTo(toPx(value), chart.chartArea.bottom);
+                ctx.stroke();
+                ctx.setLineDash([]);
+            });
+
+            // Outliers: pontos fora das hastes, vermelho se fora da spec
+            (bx.outliers || []).forEach(o => {
+                ctx.fillStyle = o.out_of_spec ? "#ef4444" : "#fbbf24";
+                ctx.beginPath();
+                ctx.arc(toPx(o.value), y, 3.5, 0, Math.PI * 2);
+                ctx.fill();
+            });
+
+            ctx.restore();
+        }
+    };
+}
+
+function renderBoxplot(data) {
+    if (boxplotChart) { boxplotChart.destroy(); boxplotChart = null; }
+
+    const bx = data.boxplot || {};
+    const pd = data.process_data || {};
+    const outlierCount = (bx.outliers || []).length;
+    document.getElementById("bxOutlierCount").textContent = outlierCount
+        ? `${outlierCount} outlier${outlierCount > 1 ? "s" : ""}`
+        : "";
+
+    if (bx.q1 == null) return;
+
+    const allValues = [bx.whisker_low, bx.whisker_high, pd.lsl, pd.usl, ...(bx.outliers || []).map(o => o.value)]
+        .filter(v => v != null);
+    const min = Math.min(...allValues);
+    const max = Math.max(...allValues);
+    const pad = (max - min) * 0.08 || 1;
+
+    const ctx = document.getElementById("boxplotChart");
+    boxplotChart = new Chart(ctx, {
+        type: "bar",
+        data: {
+            labels: [data.step || ""],
+            datasets: [{
+                label: "Q1–Q3",
+                data: [[bx.q1, bx.q3]],
+                backgroundColor: "rgba(99, 102, 241, 0.55)",
+                borderColor: "#818cf8",
+                borderWidth: 1.5,
+                barThickness: 34
+            }]
+        },
+        plugins: [boxplotDecorationsPlugin(bx, pd.lsl, pd.usl, pd.target)],
+        options: {
+            indexAxis: "y",
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                datalabels: { display: false },
+                tooltip: { enabled: false }
+            },
+            scales: {
+                x: {
+                    min: min - pad, max: max + pad,
+                    title: { display: true, text: data.step, color: "#94a3b8" },
+                    ticks: { color: "#94a3b8" },
+                    grid: { color: "rgba(148, 163, 184, 0.08)" }
+                },
+                y: {
+                    ticks: { color: "#94a3b8" },
+                    grid: { display: false }
+                }
+            }
+        }
+    });
 }
 
 async function openSpcPanel() {
@@ -585,6 +928,8 @@ async function openSpcPanel() {
 function closeSpcPanel() {
     document.getElementById("spcOverlay").hidden = true;
     if (spcChart) { spcChart.destroy(); spcChart = null; }
+    if (probabilityPlotChart) { probabilityPlotChart.destroy(); probabilityPlotChart = null; }
+    if (boxplotChart) { boxplotChart.destroy(); boxplotChart = null; }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +973,7 @@ function renderStepSpecsTable(rows) {
     tbody.innerHTML = "";
 
     if (!rows.length) {
-        tbody.innerHTML = `<tr><td colspan="7" class="cm-empty">Nenhum step paramétrico com dado numérico no filtro atual.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="cm-empty">Nenhum step paramétrico com dado numérico no filtro atual.</td></tr>`;
         return;
     }
 
@@ -661,6 +1006,9 @@ function renderStepSpecsTable(rows) {
                        value="${row.usl_is_override ? row.usl : ""}"
                        placeholder="${Number(row.usl).toFixed(4)}${autoTag}"></td>
             <td><span class="cm-status ${statusCls}">${statusTxt}</span></td>
+            <td><input type="text" maxlength="500" class="step-comment-input"
+                       value="${escapeHtmlAttr(row.comment || "")}"
+                       placeholder="anotação livre..."></td>
             <td><button type="button" class="cm-reset-btn step-detail-btn">Detalhar</button></td>
         `;
 
@@ -680,8 +1028,23 @@ function renderStepSpecsTable(rows) {
             }
         };
 
+        // Comentário salva independente do LSL/USL (chave própria no corpo
+        // do POST) — editar um não apaga o outro, ver set_step_spec().
+        const saveComment = async () => {
+            const commentRaw = tr.querySelector(".step-comment-input").value;
+            try {
+                await postJson("/api/spc/specs/set/", {
+                    step: row.step,
+                    comment: commentRaw === "" ? null : commentRaw
+                });
+            } catch (err) {
+                alert(`Erro ao salvar comentário: ${err.message}`);
+            }
+        };
+
         tr.querySelector(".step-lsl-input").addEventListener("change", saveOverride);
         tr.querySelector(".step-usl-input").addEventListener("change", saveOverride);
+        tr.querySelector(".step-comment-input").addEventListener("change", saveComment);
 
         tr.querySelector(".step-detail-btn").addEventListener("click", async () => {
             document.getElementById("stepSelect").value = row.step;
@@ -805,6 +1168,11 @@ async function loadFilterOptions() {
     fillSelect(document.getElementById("filterModel"), "Todos os modelos", data.models || []);
     fillSelect(document.getElementById("filterCarrier"), "Todos os carriers", data.carriers || []);
     fillSelect(document.getElementById("filterStep"), "Todos os steps", data.failures || []);
+    // Popula o dropdown do relatório de Cp/Cpk com uma fonte barata (metadado
+    // do schema, sem varrer mes_test_results) — a lista real e completa (só
+    // steps com dado numérico no filtro atual) substitui isso assim que o
+    // usuário abrir o modal "Cp/Cpk de Todos os Steps" (refreshStepSpecsOverview).
+    fillStepSelect(data.step_candidates || []);
 }
 
 function fillChannelSelect() {
@@ -1236,9 +1604,11 @@ async function loadCarrierChannelMatrix() {
 
 async function loadDashboard() {
     // 1º: o banco está recebendo dados? (alimenta a faixa de status e a
-    // âncora de tempo das tabelas "última hora"). Os ciclos dos carriers vêm
-    // junto, antes das matrizes, para os badges terem os números prontos.
-    await Promise.all([refreshDebugStatus(), loadCarrierCycles()]);
+    // âncora de tempo das tabelas "última hora"). Os ciclos dos carriers NÃO
+    // rodam mais aqui — é uma query cara (varre o histórico inteiro de cada
+    // carrier) que não precisa de atualização por minuto; tem timer próprio
+    // em applyCarrierCyclesInterval().
+    await refreshDebugStatus();
 
     if (appMode === "online") {
         onlineAutoDates();
@@ -1260,6 +1630,45 @@ async function resetFilters() {
     document.getElementById("filterModel").value = "";
     setDefaultDates();
     await loadDashboard();
+}
+
+// Exporta o dataset do filtro atual (data/hora + demais filtros da tela
+// ANÁLISE) em .xlsx para analisar no Minitab/Excel — ver
+// services.export_dataset_xlsx() pro formato exato das colunas e a nota
+// sobre o Unit_ID sintético (sem serial real no PCM_TESTER).
+async function exportFilteredXlsx(btn) {
+    const originalText = btn ? btn.textContent : null;
+    if (btn) { btn.disabled = true; btn.textContent = "Gerando .xlsx..."; }
+
+    try {
+        const query = getFiltersQuery();
+        const response = await fetch(`/api/export/xlsx/?${query}`);
+
+        if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            alert(data.error || "Falha ao gerar a exportação.");
+            return;
+        }
+
+        const blob = await response.blob();
+        const disposition = response.headers.get("Content-Disposition") || "";
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        const filename = match ? match[1] : "mes_export.xlsx";
+
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+    } catch (err) {
+        console.error("Erro ao exportar xlsx:", err);
+        alert("Falha ao gerar a exportação. Veja o console para detalhes.");
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = originalText; }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,10 +1841,17 @@ async function initDashboard() {
 
     setDefaultDates();
     await loadFilterOptions();
-    await refreshStepSpecsOverview();
     await checkOnlineStatus();
+    // loadCarrierCycles() é uma consulta cara (varre o histórico inteiro de
+    // cada carrier, ~10-15s) que só alimenta o badge de alerta de ciclos —
+    // não precisa bloquear o resto do dashboard. Roda em paralelo, sem
+    // await: o restante da tela (yield, pareto, UPH, canais, matrizes)
+    // aparece assim que loadDashboard() (rápido) terminar, e o badge se
+    // atualiza sozinho quando loadCarrierCycles() concluir.
+    loadCarrierCycles();
     await loadDashboard();
     applyRefreshInterval();
+    applyCarrierCyclesInterval();
 }
 
 initDashboard();
